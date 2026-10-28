@@ -42,6 +42,56 @@ function toast(msg, isErr = false) {
   toastTimer = setTimeout(() => el.remove(), 4200);
 }
 
+/* 统一对话框：操作前说明结果，避免浏览器原生 prompt/confirm。 */
+function askDialog({ title, message = "", inputType = "", choices = null, confirmLabel = "确认" }) {
+  return new Promise((resolve) => {
+    const priorFocus = document.activeElement;
+    const dialog = document.createElement("dialog");
+    dialog.className = "rh-dialog";
+    dialog.setAttribute("aria-labelledby", "rh-dialog-title");
+    const field = inputType
+      ? `<input class="rh-dialog-input" type="${inputType === "password" ? "password" : "text"}"
+          aria-label="${esc(title)}" autocomplete="off">` : "";
+    const options = choices
+      ? `<div class="rh-dialog-choices">${choices.map((c) =>
+          `<button type="button" class="rh-choice" data-choice="${esc(c.value)}">${esc(c.label)}</button>`).join("")}</div>` : "";
+    dialog.innerHTML = `<div class="rh-dialog-inner"><div class="rh-dialog-title" id="rh-dialog-title">${esc(title)}</div>
+      ${message ? `<p>${esc(message)}</p>` : ""}${field}${options}
+      <div class="rh-dialog-actions"><button type="button" class="ghost" data-cancel>取消</button>
+        ${choices ? "" : `<button type="button" class="primary" data-confirm>${esc(confirmLabel)}</button>`}</div></div>`;
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      dialog.close();
+      dialog.remove();
+      priorFocus?.focus?.();
+      resolve(value);
+    };
+    dialog.querySelector("[data-cancel]").onclick = () => finish(null);
+    dialog.querySelector("[data-confirm]")?.addEventListener("click", () =>
+      finish(inputType ? dialog.querySelector(".rh-dialog-input").value.trim() : true));
+    dialog.querySelectorAll("[data-choice]").forEach((b) => b.onclick = () => finish(b.dataset.choice));
+    dialog.addEventListener("cancel", (e) => { e.preventDefault(); finish(null); });
+    dialog.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && inputType) { e.preventDefault(); dialog.querySelector("[data-confirm]").click(); }
+    });
+    document.body.appendChild(dialog);
+    dialog.showModal();
+    (dialog.querySelector(".rh-dialog-input") || dialog.querySelector("[data-choice]") ||
+      dialog.querySelector("[data-confirm]"))?.focus();
+  });
+}
+async function uiConfirm(message, title = "确认操作") {
+  return (await askDialog({ title, message })) === true;
+}
+async function uiPrompt(title, { message = "", type = "text" } = {}) {
+  return askDialog({ title, message, inputType: type, confirmLabel: "继续" });
+}
+async function uiChoice(title, choices, message = "") {
+  return askDialog({ title, message, choices });
+}
+
 /* 兜底：任何异步异常都可见，绝不让交互静默失效 */
 window.addEventListener("unhandledrejection", (e) => {
   toast(`页面内部错误：${String(e.reason).slice(0, 160)}`, true);
@@ -160,8 +210,8 @@ document.addEventListener("click", async (e) => {
   const next = (b.dataset.cur || "") === val ? "" : val;
   try {
     await api(`/api/runs/${runId}/findings/${idx}/mark`, { method: "POST", body: { disposition: next } });
-    toast(next === "false_positive" ? "已标记误报（计入误报率）"
-      : next === "confirmed" ? "已标记确认" : "已撤销标记");
+    toast(next === "false_positive" ? "已标记误报；可保存负例样本，或加入不再报告规则"
+      : next === "confirmed" ? "已确认问题；可保存为应报出的回归样本" : "已撤销判定");
     if (location.hash === `#/runs/${runId}`) renderRun(runId, true);
     else if (location.hash === "#/workbench") refreshWorkbenchData();
   } catch (err) { toast(err.message, true); }
@@ -187,8 +237,8 @@ document.addEventListener("click", async (e) => {
   try {
     const r = await api("/api/eval/cases", { method: "POST",
       body: { run_id: +b.dataset.evalRun, idx: +b.dataset.evalIdx } });
-    toast(r.existed ? "这条已经在工作台的评测集里"
-      : `已存为评测用例（${r.polarity === "positive" ? "正例：应报出" : "负例：不应再报出"}）`);
+    toast(r.existed ? "这条已经在工作台的回归样本里"
+      : `已保存为回归样本（${r.polarity === "positive" ? "应报出" : "不应再报出"}）`);
     if (location.hash === "#/workbench") refreshWorkbenchData();
   } catch (err) { toast(err.message, true); }
 });
@@ -442,12 +492,11 @@ async function renderRunsList(qs = "") {
   let runs;
   try { runs = await fetchRuns(); }
   catch (e) { errorPanel(e.message); return; }
-  const sel = (id, val, opts, label) => `
-    <select id="${id}" style="width:auto">
-      <option value="">${label}</option>
-      ${Object.entries(opts).map(([v, l]) =>
-        `<option value="${v}" ${val === v ? "selected" : ""}>${l}</option>`).join("")}
-    </select>`;
+  const chips = (key, val, opts, label) => `<div class="rf-chip-group">
+    <span>${label}</span>
+    <div class="rf-chips"><button class="rf-chip ${!val ? "on" : ""}" data-rf="${key}" data-value="">全部</button>
+      ${Object.entries(opts).map(([v, l]) => `<button class="rf-chip ${val === v ? "on" : ""}"
+        data-rf="${key}" data-value="${v}">${l}</button>`).join("")}</div></div>`;
   const titleBits = [status && STATUS_LABEL[status], trigger && TRIGGER_LABEL[trigger],
     reverted && "已回滚", since && `自 ${since}`].filter(Boolean).join(" · ");
   $app.innerHTML = `
@@ -455,28 +504,33 @@ async function renderRunsList(qs = "") {
       title: `审查${titleBits ? ` <span class="muted" style="font-size:14px;font-weight:400">· ${esc(titleBits)}</span>` : ""}`,
       sub: `${runs.length} 条记录 · 点行看报告`,
     })}
-    <div class="actions" style="margin-bottom:12px">
-      ${sel("rf-status", status, STATUS_LABEL, "全部状态")}
-      ${sel("rf-trigger", trigger, TRIGGER_LABEL, "全部触发")}
-      <label class="small" style="display:flex;align-items:center;gap:6px;cursor:pointer">
-        <input type="checkbox" id="rf-reverted" ${reverted ? "checked" : ""} style="width:auto"> 仅看回滚</label>
-      <input type="date" id="rf-since" value="${esc(since)}" style="width:auto" title="起始日期">
-      <button class="ghost small-btn" id="rf-clear">清除筛选</button>
+    <div class="rf-toolbar">
+      ${chips("status", status, STATUS_LABEL, "结果")}
+      ${chips("trigger", trigger, TRIGGER_LABEL, "触发")}
+      <div class="rf-extra"><label class="small"><input type="checkbox" id="rf-reverted" ${reverted ? "checked" : ""}> 仅看回滚</label>
+        <label class="small">起始日期 <input type="date" id="rf-since" value="${esc(since)}"></label>
+        <button class="ghost small-btn" id="rf-clear">清除筛选</button></div>
     </div>
-    <div class="panel">${runTable(runs, true)}</div>`;
-  const reroute = () => {
+    <div class="panel run-table-desktop">${runTable(runs, true)}</div>
+    <div class="run-cards-mobile">${runs.map((r) => `<a class="panel run-card-mobile" href="#/runs/${r.id}">
+      <span class="run-card-line">${statusHtml(r.status)}<span class="muted small">${fmtTime(r.created_at)}</span></span>
+      <strong>${esc(r.project)} · ${r.pr_number ? "PR #" + r.pr_number : esc((r.head_sha || r.ref || "").slice(0, 8))}</strong>
+      <span class="run-card-sub">${esc((r.commit_msg || "").split("\n")[0] || r.branch || r.ref || "审查记录")}</span>
+      <span class="run-card-line"><span class="small muted">${TRIGGER_LABEL[r.trigger] || esc(r.trigger)}${r.tier ? " · 风险 " + (TIER_LABEL[r.tier] || esc(r.tier)) : ""}</span>
+        ${r.important_count ? `<span class="badge imp">${r.important_count} Important</span>` : ""}</span>
+    </a>`).join("")}</div>`;
+  const reroute = (override = {}) => {
     const q = new URLSearchParams();
-    const st = $("rf-status").value, tr = $("rf-trigger").value;
+    const st = override.status ?? status, tr = override.trigger ?? trigger;
     if (st) q.set("status", st);
     if (tr) q.set("trigger", tr);
     if ($("rf-reverted").checked) q.set("reverted", "1");
     if ($("rf-since").value) q.set("since", $("rf-since").value);
     location.hash = `#/runs${q.toString() ? "?" + q.toString() : ""}`;
   };
-  $("rf-status").onchange = reroute;
-  $("rf-trigger").onchange = reroute;
-  $("rf-reverted").onchange = reroute;
-  $("rf-since").onchange = reroute;
+  document.querySelectorAll("[data-rf]").forEach((b) => b.onclick = () => reroute({ [b.dataset.rf]: b.dataset.value }));
+  $("rf-reverted").onchange = () => reroute();
+  $("rf-since").onchange = () => reroute();
   $("rf-clear").onclick = () => { location.hash = "#/runs"; };
   bindRunRows();
 }
@@ -535,7 +589,7 @@ function ledgerMarksTable(marks) {
         <td>${m.disposition === "false_positive"
           ? `<button class="ghost small-btn" data-fb-run="${m.run_id}" data-fb-idx="${m.idx}"
                data-fb-title="${esc(m.title)}" data-fb-file="${esc(m.file || "")}"
-               title="写进评审规则的「一律不报」，并自动存为负例评测用例">回流规则</button>` : ""}</td>
+               title="写入不再报告规则，并保存为负例样本">修正规则</button>` : ""}</td>
       </tr>`).join("")}</tbody></table>`;
 }
 
@@ -559,8 +613,6 @@ function paintMarks(data) {
   bindRunRows();
   document.querySelectorAll(".mk-sel").forEach((c) =>
     (c.onchange = () => { c.checked ? marksSel.add(c.dataset.key) : marksSel.delete(c.dataset.key); syncBatchBar(); }));
-  document.querySelectorAll("[data-fb-run]").forEach((b) =>
-    (b.onclick = () => feedbackRule(b.dataset.fbRun, b.dataset.fbIdx, b.dataset.fbTitle, b.dataset.fbFile)));
   syncBatchBar();
 }
 
@@ -585,11 +637,12 @@ async function batchMark(val) {
 }
 
 async function feedbackRule(runId, idx, title, file) {
-  if (!confirm(`把这条误报写进评审规则的「一律不报」清单？\n\n${title}`)) return;
+  if (!await uiConfirm(`将“${title}”写入“不再报告”规则，并保存为负例样本？之后可运行回归评测，检查它是否再次出现。`,
+    "修正规则并保存样本")) return;
   try {
     const p = await api("/api/prompt");
     let rules = p.rules || "";
-    if (rules.includes(title)) { toast("这条模式已在规则里"); }
+    if (rules.includes(title)) { toast("这条模式已在规则里，继续检查负例样本"); }
     else {
       const line = `- ${title}（样例 ${file || "无文件信息"} · run#${runId}，已确认误报）`;
       const anchor = "## 一律不报";
@@ -597,16 +650,22 @@ async function feedbackRule(runId, idx, title, file) {
                                      : rules + `\n${anchor}\n${line}\n`;
       await api("/api/prompt", { method: "PUT", body: { rules } });
     }
-    // 回流的误报自动存为负例评测用例——规则改动有没有压住它,下轮跑分见
+    // 已确认的误报保存为负例样本，下一次回归评测检查它是否再次出现。
     try {
       const r = await api("/api/eval/cases", { method: "POST", body: { run_id: +runId, idx: +idx } });
-      toast(r.existed ? "已回流规则（用例已在评测集）"
-        : "已回流规则，并自动存为负例评测用例——到工作台跑分验证");
+      toast(r.existed ? "规则已更新，负例样本已存在"
+        : "规则已更新，负例样本已保存；可到工作台运行回归评测");
     } catch (e) {
-      toast(`规则已回流；自动存评测用例未成功：${e.message}`, true);
+      toast(`规则已更新；负例样本保存失败：${e.message}`, true);
     }
   } catch (e) { toast(e.message, true); }
 }
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-fb-run]");
+  if (!b) return;
+  e.stopPropagation();
+  feedbackRule(b.dataset.fbRun, b.dataset.fbIdx, b.dataset.fbTitle, b.dataset.fbFile);
+});
 
 async function refreshMarks() {
   const q = new URLSearchParams();
@@ -618,264 +677,226 @@ async function refreshMarks() {
   paintMarks(data);
 }
 
-/* 工作台：队列决定阅读顺序；同屏显示发现、证据和处置。 */
-const wbState = { projects: [], runs: [], marks: null, metrics: null, eval: null,
-  run: null, finding: 0, diff: new Map() };
+/* 工作台只负责回答「现在做什么、质量有没有改善」；报告页负责逐条审查。 */
+let qualityData = null;
 
-function wbMatches(item) {
-  if (marksFilter.project_id && item.project_id !== marksFilter.project_id) return false;
-  return !workbenchSearch || `${item.project || ""} ${item.title || ""} ${item.file || ""}
-    ${item.pr_number || ""} ${item.head_sha || ""} ${item.run_id || item.id || ""}`
-    .toLowerCase().includes(workbenchSearch);
+function qualityLatest(d) { return d.eval.history?.[0] || null; }
+function qualityNeedsRerun(d) {
+  const h = qualityLatest(d);
+  return !!h && h.status === "done" &&
+    (d.eval.cases.length !== h.cases_total ||
+      JSON.stringify(h.config || {}) !== JSON.stringify(d.eval.current_config || {}));
 }
-
-function wbPending() { return (wbState.marks?.pending || []).filter(wbMatches); }
-function wbRuns() {
-  return wbState.runs.filter((r) => wbMatches(r) && (!workbenchPrOnly || r.pr_number));
+function qualityResultLabel(h) {
+  if (!h) return "尚未运行";
+  if (h.status === "running") return "评测进行中";
+  if (h.status === "failed") return "评测执行失败";
+  const issues = (h.miss || 0) + (h.fp || 0) + (h.error || 0);
+  return issues ? `${issues} 项需要检查` : `${h.hit || 0} / ${h.cases_total || 0} 个样本符合预期`;
 }
-function wbQueueHtml() {
-  const pending = wbPending(), runs = wbRuns();
-  return `<div class="wb-queue-head"><b>待处理发现 <span class="wb-count">${pending.length}</span></b>
-      <span class="small muted">先处理 Important</span></div>
-    <div class="wb-pending-list">${pending.length ? pending.map((f) => `
-      <button class="wb-queue-item ${wbState.run?.id === f.run_id && wbState.finding === f.idx ? "active" : ""}"
-        data-wb-run="${f.run_id}" data-wb-idx="${f.idx}">
-        <span class="wb-item-top"><span class="badge imp">Important</span><span class="muted small">${fmtAgo(f.created_at)}</span></span>
-        <strong>${esc(f.title)}</strong>
-        <span class="mono muted">${esc(f.project)} · ${esc(f.file || "门禁")}${f.line ? ":" + esc(f.line) : ""}</span>
-      </button>`).join("") : '<div class="wb-queue-empty">当前没有待处理 Important</div>'}</div>
-    <div class="wb-queue-head wb-recent-head"><b>近期审查</b><a href="#/runs" class="small">全部审查 →</a></div>
-    <label class="wb-toggle"><input id="wb-pr-only" type="checkbox" ${workbenchPrOnly ? "checked" : ""}> 只看 PR</label>
-    <div class="wb-run-list">${runs.length ? runs.map((r) => `
-      <button class="wb-run-item ${wbState.run?.id === r.id ? "active" : ""}" data-wb-run="${r.id}">
-        <span class="wb-run-main">${statusHtml(r.status)}<strong>${esc(r.project)} · ${r.pr_number ? "PR #" + r.pr_number : esc((r.head_sha || r.ref || "").slice(0, 8))}</strong></span>
-        <span class="wb-run-meta">${r.important_count ? '<span class="badge imp">' + r.important_count + ' Important</span>' : ""}
-          <span>${fmtAgo(r.created_at)}</span></span>
-      </button>`).join("") : '<div class="wb-queue-empty">当前筛选下没有审查</div>'}</div>`;
+function qualityShortResult(h) {
+  if (!h) return "未运行";
+  if (h.status === "running") return "进行中";
+  if (h.status === "failed") return "失败";
+  const issues = (h.miss || 0) + (h.fp || 0) + (h.error || 0);
+  return issues ? `${issues} 项异常` : `${h.hit || 0}/${h.cases_total || 0} 符合预期`;
 }
-
-function wbFindingListHtml(run) {
-  const items = run.findings || [];
-  if (!items.length) return `<div class="wb-empty-review"><b>${run.status === "passed" ? "没有阻断发现" : "尚无发现"}</b>
-    <span>${run.status === "running" ? "审查完成后这里会更新" : "可打开完整报告检查执行过程"}</span></div>`;
-  return items.map((f, i) => `<button class="wb-finding-item ${wbState.finding === i ? "active" : ""}"
-      data-wb-finding="${i}">
-      <span class="wb-item-top"><span class="badge ${f.severity === "IMPORTANT" ? "imp" : ""}">${esc(f.severity || "发现")}</span>
-        ${f.disposition ? '<span class="badge ' + (f.disposition === "confirmed" ? "confirmed" : "fp") + '">' + (f.disposition === "confirmed" ? "已确认" : "误报") + '</span>' : ""}</span>
-      <strong>${esc(f.title)}</strong>
-      <span class="mono muted">${esc(f.file || "门禁")}${f.line ? ":" + esc(f.line) : ""}</span>
-    </button>`).join("");
-}
-
-function wbEvidenceHtml(run, f, idx) {
-  if (!f) return `<div class="wb-empty-review">选择左侧发现，查看触发条件、代码和建议</div>`;
-  const important = f.severity === "IMPORTANT";
-  return `<div class="wb-evidence-head">
-      <div><span class="badge ${important ? "imp" : ""}">${esc(f.severity || "发现")}</span>
-        <span class="small muted">${esc((f.sources || []).join(" + "))}</span></div>
-      <button class="ghost small-btn" data-copy-run="${run.id}" data-copy-idx="${idx}">复制问题</button>
-    </div>
-    <h2>${esc(f.title)}</h2>
-    <div class="wb-file-line">${fileLink(run, f.file, f.line)}</div>
-    <section class="wb-evidence-section"><div class="ctx-label">触发条件 / 影响</div><p>${esc(f.condition || "未提供触发条件")}</p></section>
-    <div class="wb-evidence-actions">
-      ${important ? `<button class="${f.disposition === "confirmed" ? "primary" : "ghost"} small-btn"
-        data-mark="confirmed" data-run="${run.id}" data-idx="${idx}" data-cur="${esc(f.disposition || "")}">${f.disposition === "confirmed" ? "已确认 ✓" : "确认问题"}</button>
-      <button class="${f.disposition === "false_positive" ? "primary" : "ghost"} small-btn"
-        data-mark="false_positive" data-run="${run.id}" data-idx="${idx}" data-cur="${esc(f.disposition || "")}">${f.disposition === "false_positive" ? "已标误报 ✓" : "标记误报"}</button>
-      ${f.disposition ? `<button class="ghost small-btn" data-eval-run="${run.id}" data-eval-idx="${idx}">存为评测用例</button>` : ""}` : ""}
-      <a href="#/runs/${run.id}" class="wb-report-link">完整报告 →</a>
-    </div>
-    <section class="wb-evidence-section"><div class="ctx-label">建议修复</div><p>${esc(f.fix || "未提供建议")}</p></section>
-    <section class="wb-evidence-section"><div class="ctx-label">对应代码</div>
-      <div id="wb-code" class="wb-code">${run.has_diff && f.file ? "正在定位 diff…" : "本次审查没有保存可定位的 diff"}</div></section>`;
-}
-
-function wbDiffExcerpt(diff, file, line) {
-  const src = String(diff || "").split("\n"), rows = [];
-  let active = false, current = 0;
-  for (const raw of src) {
-    if (raw.startsWith("diff --git ")) { active = raw.endsWith(" b/" + file); continue; }
-    if (!active) continue;
-    if (raw.startsWith("@@")) {
-      const m = raw.match(/\+(\d+)/);
-      current = m ? +m[1] : 0;
-      continue;
-    }
-    if (!current || raw.startsWith("---") || raw.startsWith("+++")) continue;
-    const number = current;
-    if (!raw.startsWith("-")) current++;
-    if (Math.abs(number - line) <= 4 && !raw.startsWith("\\")) rows.push({ number, raw });
+function qualityNext(d) {
+  const pending = d.marks.stats.pending, cases = d.eval.cases.length, h = qualityLatest(d);
+  if (pending) return {
+    tone: "attention", label: "先处理审查结果",
+    title: `${pending} 条 Important 等待人工判断`,
+    text: "到审查报告核对完整理由，再标记为真实问题或误报。",
+    href: d.marks.pending[0] ? `#/runs/${d.marks.pending[0].run_id}` : "#/runs",
+    action: "打开待处理报告",
+  };
+  const failedReview = d.runs.find((r) => r.status === "failed" && ageDays(r.created_at) <= 7);
+  if (failedReview) return { tone: "attention", label: "排查审查执行失败",
+    title: "最近有审查没有完成", text: "打开报告查看失败步骤；确认原因后再决定是否重新审查。",
+    href: `#/runs/${failedReview.id}`, action: "查看失败报告" };
+  if (h?.status === "failed" || (h?.status === "done" && ((h.miss || 0) + (h.fp || 0) + (h.error || 0)))) {
+    return { tone: "attention", label: "检查回归结果", title: "已有样本未达到预期",
+      text: "查看漏报、误报重现或执行错误，修正规则或模型配置后再跑一轮。",
+      action: "查看逐项结果", toggle: true };
   }
-  return rows.length ? `<div class="wb-code-lines">${rows.map(({number, raw}) => `
-    <div class="wb-code-row ${raw.startsWith("+") ? "add" : raw.startsWith("-") ? "del" : ""} ${number === +line ? "focus" : ""}">
-      <span>${raw.startsWith("-") ? "" : number}</span><code>${esc(raw)}</code></div>`).join("")}</div>`
-    : '<span class="muted">未在保存的 diff 中找到该行；可从文件链接查看完整代码。</span>';
+  if (h?.status === "running") return { tone: "ready", label: "等待评测完成",
+    title: "回归评测正在运行", text: "逐条样本会重新评审；完成后检查漏报、误报重现和执行错误。",
+    action: "查看评测进度", toggle: true };
+  if (qualityNeedsRerun(d)) return { tone: "ready", label: "重新验证当前配置",
+    title: "配置或样本已变化", text: "上次结果不能代表当前全局配置和样本集，运行新一轮回归。",
+    action: "重新运行评测", runEval: true };
+  const positiveCases = d.eval.cases.filter((c) => c.polarity === "positive").length;
+  const confirmed = d.marks.marks.find((m) => m.disposition === "confirmed");
+  if (d.marks.stats.confirmed && !positiveCases && confirmed) return {
+    tone: "ready", label: "补足漏报检验",
+    title: "还没有“应报出”的正例样本",
+    text: "从已确认的真实问题里选一条保存，之后才能检验评审是否漏报。",
+    href: `#/runs/${confirmed.run_id}`, action: "打开已确认报告" };
+  if (cases && !h) return { tone: "ready", label: "建立质量基线",
+    title: `${cases} 条样本已准备好`,
+    text: "运行首轮评测，后续改规则或模型时用相同样本检查退化。",
+    action: "运行首次评测", runEval: true };
+  if (!cases && d.marks.stats.total) return {
+    tone: "ready", label: "把判断变成可重复的检验",
+    title: "选择已判定的 Important 保存为样本",
+    text: "真实问题存为应报出的正例；误报存为不应再出现的负例。",
+    href: d.marks.marks[0] ? `#/runs/${d.marks.marks[0].run_id}` : "#/runs",
+    action: "打开已判定报告",
+  };
+  return { tone: "clear", label: "当前无需人工处理",
+    title: cases ? "继续关注下一轮审查" : d.runs.length ? "当前没有待判断的 Important" : "等待首轮审查结果",
+    text: cases ? `现有 ${cases} 条样本可在规则或模型变更后重跑检验。`
+      : d.projects.length ? "可以在项目页启动审查；有需要判断的结果时，这里会给出下一步。"
+        : "接入仓库并触发审查后，这里会给出下一步。",
+    href: cases ? "#/runs" : "#/projects",
+    action: cases ? "查看审查记录" : d.projects.length ? "查看项目" : "接入仓库" };
 }
-
-async function wbLoadDiff() {
-  const run = wbState.run, f = run?.findings?.[wbState.finding], box = $("wb-code");
-  if (!run || !f?.file || !run.has_diff || !box) return;
-  const selected = wbState.finding;
-  try {
-    if (!wbState.diff.has(run.id)) wbState.diff.set(run.id, (await api(`/api/runs/${run.id}/diff`)).diff || "");
-    if (wbState.run?.id === run.id && wbState.finding === selected && $("wb-code")) {
-      $("wb-code").innerHTML = wbDiffExcerpt(wbState.diff.get(run.id), f.file, +f.line);
-    }
-  } catch (e) { if ($("wb-code")) $("wb-code").textContent = "代码加载失败：" + e.message; }
+function qualityAttentionHtml(d) {
+  const grouped = new Map();
+  for (const item of d.marks.pending) {
+    if (!grouped.has(item.run_id)) grouped.set(item.run_id, { ...item, count: 0 });
+    grouped.get(item.run_id).count++;
+  }
+  const pending = [...grouped.values()].slice(0, 4);
+  const failed = d.runs.filter((r) => r.status === "failed" && ageDays(r.created_at) <= 7).slice(0, 2);
+  if (!pending.length && !failed.length) return '<div class="qa-empty">暂无需要处理的报告。新的 Important 或执行失败会出现在这里。</div>';
+  return `${pending.map((r) => `<div class="qa-task-row">
+      <span class="qa-task-dot alert"></span><div class="qa-task-main"><strong>${esc(r.project)} · run #${r.run_id}</strong>
+        <span>${r.count} 条 Important 待判定 · ${fmtAgo(r.created_at)}</span></div>
+      <a href="#/runs/${r.run_id}">打开报告 →</a></div>`).join("")}
+    ${failed.map((r) => `<div class="qa-task-row"><span class="qa-task-dot"></span>
+      <div class="qa-task-main"><strong>${esc(r.project)} · run #${r.id}</strong><span>审查执行失败 · ${fmtAgo(r.created_at)}</span></div>
+      <a href="#/runs/${r.id}">查看原因 →</a></div>`).join("")}`;
 }
-
-function wbReviewHtml() {
-  const run = wbState.run;
-  if (!run) return '<div class="wb-empty-review">暂无审查记录。接入项目后，审查会显示在这里。</div>';
-  const f = (run.findings || [])[wbState.finding];
-  return `<div class="wb-review-head">
-      <div><span class="wb-eyebrow">当前审查 · RUN #${run.id}</span>
-        <h2>${esc(run.project)} ${run.pr_number ? "· PR #" + run.pr_number : "· " + esc((run.head_sha || "").slice(0, 8))}</h2>
-        <div class="small muted">${esc(run.repo || run.branch || "")} · ${fmtTime(run.created_at)}
-          ${run.files_changed != null ? " · " + run.files_changed + " 文件" : ""}</div></div>
-      <div class="wb-review-status">${statusHtml(run.status)}<a href="#/runs/${run.id}">完整报告 ↗</a></div>
-    </div>
-    <div class="wb-review-split">
-      <div class="wb-findings"><div class="wb-pane-label">审查发现 <span>${(run.findings || []).length}</span></div>
-        <div class="wb-findings-list">${wbFindingListHtml(run)}</div></div>
-      <div class="wb-evidence" id="wb-evidence">${wbEvidenceHtml(run, f, wbState.finding)}</div>
+function qualityEvalHtml(d) {
+  const h = qualityLatest(d), cases = d.eval.cases, positives = cases.filter((c) => c.polarity === "positive").length;
+  const changed = qualityNeedsRerun(d);
+  return `<div class="qa-eval-top"><span class="qa-status ${h?.status === "failed" || (h?.miss || 0) + (h?.fp || 0) + (h?.error || 0) ? "warn" : ""}">${qualityResultLabel(h)}</span>
+    <span class="muted small">${h ? "上次 " + fmtTime(h.created_at) : "还没有基线"}</span></div>
+    <p>${cases.length} 条回归样本：${positives} 条应报出，${cases.length - positives} 条不应再报出。</p>
+    ${cases.length && !positives ? '<div class="qa-eval-note">目前只有负例，还不能检验真实问题是否漏报。</div>' : ""}
+    ${h ? `<div class="qa-eval-counts"><span>漏报 <b>${h.miss || 0}</b></span><span>误报重现 <b>${h.fp || 0}</b></span><span>执行错误 <b>${h.error || 0}</b></span></div>` : ""}
+    ${changed ? '<div class="qa-eval-note">全局配置或样本数量已变化，建议重新运行评测。</div>' : ""}
+    <div class="qa-eval-actions">
+      <button class="primary small-btn" id="eval-run" ${!cases.length || h?.status === "running" ? "disabled" : ""}>${h?.status === "running" ? "评测进行中…" : "运行回归评测"}</button>
+      <button class="ghost small-btn" data-qa-toggle="qa-details" aria-expanded="false">查看样本与逐项结果</button>
     </div>`;
 }
-
-function wbAnalysisHtml() {
-  const marks = (wbState.marks?.marks || []).filter(wbMatches);
-  const s = { total: marks.length,
-    confirmed: marks.filter((m) => m.disposition === "confirmed").length,
-    false_positive: marks.filter((m) => m.disposition === "false_positive").length };
-  const hist = wbState.eval?.history || [], cases = wbState.eval?.cases || [];
-  const latest = hist[0], weeks = wbState.metrics?.weeks || [];
-  const maxRuns = Math.max(1, ...weeks.map((w) => +w.runs || 0));
-  return `<section class="wb-analysis">
-    <div class="wb-analysis-title"><div><span class="wb-eyebrow">质量闭环</span><h2>处置 · 评测 · 趋势</h2></div>
-      <span class="small muted">处置按筛选展示；评测与趋势为全局</span></div>
-    <div class="wb-analysis-grid">
-      <div class="panel wb-analysis-card"><div class="wb-card-head"><h3>处置记录</h3><span class="small muted">已处置 ${s.total || 0}</span></div>
-        <div class="wb-mini-stats"><span>确认 <b>${s.confirmed || 0}</b></span><span>误报 <b>${s.false_positive || 0}</b></span></div>
-        <div class="wb-ledger">${marks.length ? marks.slice(0, 5).map((m) => `
-          <div class="wb-ledger-row"><span class="badge ${m.disposition === "confirmed" ? "confirmed" : "fp"}">${m.disposition === "confirmed" ? "确认" : "误报"}</span>
-            <a href="#/runs/${m.run_id}" title="${esc(m.title)}">${esc(m.title)}</a>
-            ${m.disposition === "false_positive" ? `<button class="ghost small-btn" data-fb-run="${m.run_id}" data-fb-idx="${m.idx}" data-fb-title="${esc(m.title)}" data-fb-file="${esc(m.file || "")}">回流</button>` : ""}</div>`).join("")
-          : '<div class="wb-queue-empty">还没有处置记录</div>'}</div>
-        <details class="wb-expand"><summary>查看完整处置台账</summary><div class="wb-overflow">${ledgerMarksTable(marks)}</div></details></div>
-      <div class="panel wb-analysis-card"><div class="wb-card-head"><h3>回归评测</h3>
-          <button class="primary small-btn" id="eval-run" ${!cases.length || latest?.status === "running" ? "disabled" : ""}>${latest?.status === "running" ? "跑分中…" : "运行评测"}</button></div>
-        <div id="eval-count" class="small muted">${cases.length} 个用例 · 正例 ${cases.filter((c) => c.polarity === "positive").length} · 负例 ${cases.filter((c) => c.polarity !== "positive").length}</div>
-        <div class="wb-eval-score">${latest ? `<strong>${latest.status === "running" ? "进行中" : latest.status === "failed" ? "失败" : (latest.hit ?? "—") + " / " + (latest.cases_total ?? "—")}</strong>
-          <span>${latest.status === "done" ? "命中用例" : "最近一轮"} · 漏报 ${latest.miss ?? "—"} · 误报重现 ${latest.fp ?? "—"}</span>`
-          : '<strong>尚无基线</strong><span>处置发现后存为用例，再运行评测</span>'}</div>
-        <details class="wb-expand"><summary>用例与逐条结果</summary>
-          <div id="eval-cases" class="wb-overflow">${evalCasesHtml(cases)}</div>
-          ${latest ? '<div class="wb-overflow">' + evalRunHtml(latest, hist[1], {id:"eval-latest"}) + '</div>' : ""}
-          ${hist.slice(1).map((h, i) => '<div class="wb-overflow">' + evalRunHtml(h, hist[i + 2]) + '</div>').join("")}
-        </details></div>
-      <div class="panel wb-analysis-card"><div class="wb-card-head"><h3>近 8 周趋势</h3><a href="#/runs" class="small">审查记录 →</a></div>
-        <div class="wb-trend">${weeks.length ? weeks.slice(-8).map((w) => `
-          <div class="wb-trend-row"><span class="mono">${esc(w.start || w.week)}</span>
-            <span class="wb-trend-track"><i style="width:${Math.round((+w.runs || 0) / maxRuns * 100)}%"></i></span>
-            <b>${w.runs}</b></div>`).join("") : '<div class="wb-queue-empty">还没有审查数据</div>'}</div>
-        <div class="wb-trend-foot">${weeks.length ? `最近一周：问题 ${weeks.at(-1).blocked} / 审查 ${weeks.at(-1).runs}
-          · 误报 ${weeks.at(-1).fp} / 已处置 ${weeks.at(-1).marked}` : "等待首轮审查"}</div>
-      </div>
-    </div></section>`;
+function qualityDetailsHtml(d) {
+  const h = qualityLatest(d), cases = d.eval.cases;
+  return `<div class="qa-details-head"><div><h3>回归样本与结果</h3>
+      <p>正例要继续报出；负例不应再出现。删除样本只影响之后的评测。</p></div>
+      <button class="ghost small-btn" data-qa-toggle="qa-details" aria-expanded="true">收起</button></div>
+    <div class="qa-detail-grid"><div><h4>保存的样本</h4>
+      ${cases.length ? cases.map((c) => `<div class="qa-case-row">
+        <span class="badge ${c.polarity === "positive" ? "confirmed" : "fp"}">${c.polarity === "positive" ? "应报出" : "不应再报"}</span>
+        ${c.run_id ? `<a href="#/runs/${c.run_id}" title="${esc(c.expected)}">${esc(c.expected)}</a>`
+          : `<span title="${esc(c.expected)}">${esc(c.expected)}</span>`}
+        <button class="danger-ghost small-btn" data-eval-del="${c.id}">删除</button></div>`).join("") : '<div class="qa-empty">还没有样本。先在报告页判定 Important，再保存为样本。</div>'}</div>
+      <div><h4>最近一轮逐项结果</h4>
+      ${h?.results?.length ? h.results.map((r) => `<div class="qa-case-row">
+        <span class="badge ${r.result === "hit" ? "confirmed" : "imp"}">${r.result === "hit" ? "符合预期" : RESULT_LABEL[r.result] || esc(r.result)}</span>
+        <span title="${esc(r.expected)}">${esc(r.expected)}</span></div>`).join("")
+        : '<div class="qa-empty">运行评测后可在这里看每条样本的结果。</div>'}</div></div>`;
 }
-
-function paintWorkbenchV2() {
-  if (!$("wb-queue")) return;
-  if ($("wb-pending-total")) $("wb-pending-total").textContent = wbPending().length;
-  if ($("wb-failed-total")) $("wb-failed-total").textContent = wbRuns().filter((r) => r.status === "failed").length;
-  if ($("wb-running-total")) $("wb-running-total").textContent = wbRuns().filter((r) => ["running", "queued"].includes(r.status)).length;
-  $("wb-queue").innerHTML = wbQueueHtml();
-  $("wb-review").innerHTML = wbReviewHtml();
-  $("wb-analysis").innerHTML = wbAnalysisHtml();
-  $("wb-pr-only").onchange = (e) => { workbenchPrOnly = e.target.checked; paintWorkbenchV2(); };
-  document.querySelectorAll("[data-fb-run]").forEach((b) =>
-    (b.onclick = () => feedbackRule(b.dataset.fbRun, b.dataset.fbIdx, b.dataset.fbTitle, b.dataset.fbFile)));
-  bindEvalActions();
-  if (wbState.run) wbLoadDiff();
+function qualityTrendHtml(d) {
+  const weeks = [...(d.metrics.weeks || [])].reverse().slice(-8);
+  const max = Math.max(1, ...weeks.map((w) => w.runs || 0));
+  const marked = weeks.reduce((n, w) => n + (w.marked || 0), 0);
+  const fp = weeks.reduce((n, w) => n + (w.fp || 0), 0);
+  return `<div class="qa-trend-head"><div><h3>近 8 周的审查与人工判断</h3>
+      <p>只用来发现审查量和误报变化；样本太少时不把比例当作质量结论。</p></div>
+      <span>误报 ${fp} / 已判定 ${marked}</span></div>
+    <div class="qa-week-grid">${weeks.length ? weeks.map((w) => `<div class="qa-week">
+      <div class="qa-week-bar"><i style="height:${Math.max(4, Math.round((w.runs || 0) / max * 100))}%"></i></div>
+      <b>${w.runs}</b><span>${esc(w.start || w.week)}</span></div>`).join("")
+      : '<div class="qa-empty">还没有足够的审查数据。</div>'}</div>`;
 }
-
+function qualityWorkbenchHtml(d) {
+  const next = qualityNext(d), h = qualityLatest(d), cases = d.eval.cases.length;
+  const nextAction = next.runEval
+    ? `<button class="primary" data-qa-run>${next.action} →</button>`
+    : next.toggle ? `<button class="primary" data-qa-toggle="qa-details">${next.action} →</button>`
+      : `<a class="primary qa-primary-link" href="${esc(next.href)}">${next.action} →</a>`;
+  return `<div class="qa-page">
+    <div class="qa-page-head"><div><span class="wb-eyebrow">审查质量</span><h1>质量工作台</h1>
+      <p>在这里决定下一步、验证评审质量；具体问题和处置在审查报告中完成。</p></div>
+      <a href="#/runs" class="qa-all-link">全部审查报告 ↗</a></div>
+    <div class="qa-hero-grid">
+      <section class="panel qa-mission ${next.tone}"><span class="qa-kicker">现在该做什么 · ${next.label}</span>
+        <h2>${next.title}</h2><p>${next.text}</p>${nextAction}</section>
+      <section class="panel qa-snapshot"><h2>当前状态</h2>
+        <div class="qa-snapshot-row"><span>待人工判断</span><strong>${d.marks.stats.pending}</strong></div>
+        <div class="qa-snapshot-row"><span>已保存的回归样本</span><strong>${cases}</strong></div>
+        <div class="qa-snapshot-row"><span>上次回归</span><strong class="qa-snapshot-result">${qualityShortResult(h)}</strong></div>
+      </section></div>
+    <section class="qa-process"><div class="qa-section-heading"><div><span class="wb-eyebrow">判断 → 沉淀 → 验证</span>
+      <h2>质量闭环怎么运作</h2></div><p>把人的判断变成可重复的检验，改规则后确认没有引入漏报。</p></div>
+      <div class="qa-process-grid">
+        <div class="panel qa-step"><span class="qa-step-num">01</span><h3>在报告里判定</h3>
+          <p>看完整发现，标记真实问题或误报。</p><span class="qa-step-foot">${d.marks.stats.pending} 条待判定</span></div>
+        <div class="panel qa-step"><span class="qa-step-num">02</span><h3>保存样本，修正规则</h3>
+          <p>真实问题存为“应报出”；误报可加入“不再报告”规则，同时存为“不应再报”样本。</p>
+          <span class="qa-step-foot">${cases} 条已保存</span></div>
+        <div class="panel qa-step"><span class="qa-step-num">03</span><h3>改动后运行回归</h3>
+          <p>检查应报出的问题有没有漏掉，误报有没有重新出现。</p>
+          <span class="qa-step-foot">${qualityResultLabel(h)}</span></div>
+      </div></section>
+    <div class="qa-operate-grid">
+      <section class="panel qa-operate"><div class="qa-card-heading"><div><h3>需要处理的报告</h3>
+        <p>工作台只列任务；打开报告查看发现并完成处置。</p></div><a href="#/runs">查看全部 →</a></div>
+        <div class="qa-task-list">${qualityAttentionHtml(d)}</div></section>
+      <section class="panel qa-operate"><div class="qa-card-heading"><div><h3>回归检验</h3>
+        <p>改规则或模型前后，拿同一批样本对照。</p></div></div>
+        <div id="qa-eval-status">${qualityEvalHtml(d)}</div></section>
+    </div>
+    <section class="panel qa-details" id="qa-details" hidden>${qualityDetailsHtml(d)}</section>
+    <section class="panel qa-trend">${qualityTrendHtml(d)}</section>
+  </div>`;
+}
 async function refreshWorkbenchData() {
-  if (location.hash !== "#/workbench") return;
-  try {
-    const [marks, run, evaluation] = await Promise.all([
-      api("/api/marks"), wbState.run ? api(`/api/runs/${wbState.run.id}`) : Promise.resolve(null),
-      api("/api/eval/last"),
-    ]);
-    wbState.marks = marks;
-    if (run) wbState.run = run;
-    wbState.eval = evaluation;
-    paintWorkbenchV2();
-  } catch (e) { toast(e.message, true); }
+  if (location.hash === "#/workbench") renderWorkbench();
 }
-
 async function renderWorkbench() {
   clearInterval(refreshTimer);
-  setTitle("工作台");
+  setTitle("质量工作台");
   showSkeleton();
   try {
-    const [projects, metrics, evaluation, runs, marks] = await Promise.all([
-      api("/api/projects"), api("/api/metrics"), api("/api/eval/last"),
-      api("/api/runs?limit=40"), api("/api/marks"),
+    const [projects, runs, marks, evaluation, metrics] = await Promise.all([
+      api("/api/projects"), api("/api/runs?limit=40"), api("/api/marks"),
+      api("/api/eval/last"), api("/api/metrics"),
     ]);
-    Object.assign(wbState, { projects, metrics, eval: evaluation, runs, marks });
-    const first = wbPending()[0]?.run_id || wbRuns().find((r) => r.status === "blocked")?.id || wbRuns()[0]?.id;
-    const selected = wbPending().some((f) => f.run_id === wbState.run?.id) ||
-      wbRuns().some((r) => r.id === wbState.run?.id) ? wbState.run.id : first;
-    wbState.run = selected ? await api(`/api/runs/${selected}`) : null;
-    wbState.finding = wbState.run?.id === wbPending()[0]?.run_id ? wbPending()[0].idx : 0;
-  } catch (e) { errorPanel(e.message); return; }
-  $app.innerHTML = `<div class="wb-page">
-    <div class="wb-top"><div><span class="wb-eyebrow">REVIEW OPERATIONS</span><h1>审查工作台</h1>
-      <p>先确认值得处理的发现，再用代码和评测判断下一步。</p></div>
-      <a class="wb-all-link" href="#/runs">浏览全部审查 ↗</a></div>
-    <div class="wb-toolbar">
-      <label class="wb-search"><span>⌕</span><input id="wb-search" aria-label="搜索审查和发现" placeholder="搜索发现、文件、项目、PR 或 run"
-        value="${esc(workbenchSearch)}"></label>
-      <select id="mf-project" aria-label="筛选项目"><option value="">全部项目</option>
-        ${wbState.projects.map((p) => `<option value="${p.id}" ${marksFilter.project_id === p.id ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select>
-      <div class="wb-summary"><span><b id="wb-pending-total">${wbPending().length}</b> 待处置</span>
-        <span><b id="wb-failed-total">${wbRuns().filter((r) => r.status === "failed").length}</b> 近期失败</span>
-        <span><b id="wb-running-total">${wbRuns().filter((r) => r.status === "running" || r.status === "queued").length}</b> 近期进行中</span></div>
-    </div>
-    <div class="wb-grid"><aside class="panel wb-queue" id="wb-queue"></aside>
-      <section class="panel wb-review" id="wb-review"></section></div>
-    <div id="wb-analysis"></div></div>`;
-  $("wb-search").oninput = (e) => { workbenchSearch = e.target.value.trim().toLowerCase(); paintWorkbenchV2(); };
-  $("mf-project").onchange = async (e) => {
-    marksFilter.project_id = +e.target.value || 0;
-    const first = wbPending()[0]?.run_id || wbRuns()[0]?.id;
-    if (!first) { wbState.run = null; wbState.finding = 0; }
-    if (first && wbState.run?.id !== first) {
-      try { wbState.run = await api(`/api/runs/${first}`); wbState.finding = 0; }
-      catch (err) { toast(err.message, true); }
-    }
-    paintWorkbenchV2();
-  };
-  paintWorkbenchV2();
-  if (wbState.eval.history?.[0]?.status === "running") pollEval();
+    if (location.hash !== "#/workbench") return;
+    qualityData = { projects, runs, marks, eval: evaluation, metrics };
+    $app.innerHTML = qualityWorkbenchHtml(qualityData);
+    bindQualityActions();
+    if (evaluation.history?.[0]?.status === "running") pollEval();
+  } catch (e) { errorPanel(e.message); }
 }
-
-document.addEventListener("click", async (e) => {
-  const runButton = e.target.closest("[data-wb-run]");
-  if (runButton) {
-    const id = +runButton.dataset.wbRun, idx = +(runButton.dataset.wbIdx || 0);
-    if (wbState.run?.id === id) { wbState.finding = idx; paintWorkbenchV2(); return; }
+function bindQualityActions() {
+  document.querySelectorAll("[data-qa-toggle]").forEach((b) => b.onclick = () => {
+    const box = $("qa-details"), opening = box.hidden;
+    box.hidden = !opening;
+    document.querySelectorAll("[data-qa-toggle]").forEach((el) => el.setAttribute("aria-expanded", String(opening)));
+    if (opening) box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  });
+  const run = async () => {
     try {
-      wbState.run = await api(`/api/runs/${id}`);
-      wbState.finding = idx;
-      paintWorkbenchV2();
-    } catch (err) { toast(err.message, true); }
-    return;
-  }
-  const findingButton = e.target.closest("[data-wb-finding]");
-  if (findingButton) { wbState.finding = +findingButton.dataset.wbFinding; paintWorkbenchV2(); }
-});
+      const result = await api("/api/eval/run", { method: "POST" });
+      if (!result.ok) { toast(result.msg, true); return; }
+      toast("评测已开始；完成后会显示漏报、误报重现和执行错误");
+      renderWorkbench();
+    } catch (e) { toast(e.message, true); }
+  };
+  document.querySelectorAll("[data-qa-run], #eval-run").forEach((b) => b.onclick = run);
+  document.querySelectorAll("[data-eval-del]").forEach((b) => b.onclick = async () => {
+    if (!await uiConfirm("删除这条回归样本？之后的评测将不再检查它。")) return;
+    try {
+      await api(`/api/eval/cases/${b.dataset.evalDel}`, { method: "DELETE" });
+      toast("样本已删除"); renderWorkbench();
+    } catch (e) { toast(e.message, true); }
+  });
+}
 
 async function renderMarks() {
   clearInterval(refreshTimer);
@@ -889,7 +910,7 @@ async function renderMarks() {
   $app.innerHTML = `
     ${pageHead({
       title: "处置",
-      sub: "人工反馈闭环：处置队列里的发现 → 确认 / 误报 → 高误报模式回流评审规则",
+      sub: "判定发现后，可把误报模式写入不再报告规则，再运行回归评测",
     })}
     <div class="stats" id="mk-stats"></div>
 
@@ -996,7 +1017,7 @@ async function renderProjects() {
   document.querySelectorAll("[data-del]").forEach((el) =>
     el.addEventListener("click", async (ev) => {
       ev.stopPropagation();
-      if (!confirm(`移除项目 ${el.dataset.name}？（审查记录一并删除）`)) return;
+      if (!await uiConfirm(`移除项目 ${el.dataset.name}？（审查记录一并删除）`)) return;
       await api(`/api/projects/${el.dataset.del}`, { method: "DELETE" });
       renderProjects();
     }));
@@ -1110,14 +1131,14 @@ function showAddForm() {
 }
 
 async function showImportForm() {
-  const org = prompt("要导入的组织名：");
+  const org = await uiPrompt("导入 GitHub 组织", { message: "输入组织名，系统会接入该组织下的仓库。" });
   if (!org) return;
-  const label = prompt("使用哪个 GitHub 连接 ID？留空表示匿名导入公开仓库。\n" +
-    githubConnections.map((c) => `${c.id}: ${c.label}${c.disabled ? "（停用）" : ""}`).join("\n"));
-  const cid = label && label.trim() ? Number(label.trim()) : null;
-  if (cid !== null && !githubConnections.some((c) => c.id === cid && !c.disabled)) {
-    toast("连接 ID 无效", true); return;
-  }
+  const choice = await uiChoice("选择 GitHub 连接",
+    [{ value: "", label: "匿名接入公开仓库" },
+      ...githubConnections.filter((c) => !c.disabled).map((c) => ({ value: String(c.id), label: c.label }))],
+    "私有仓库需要具备访问权限的连接。");
+  if (choice === null) return;
+  const cid = choice ? Number(choice) : null;
   try {
     const r = await api("/api/projects/import_org", { method: "POST", body: { org, github_connection_id: cid } });
     toast(`已导入 ${r.imported} 个仓库：正在生成项目画像（不审历史提交），之后有新 push 才审查`);
@@ -1284,7 +1305,7 @@ function paintProjectDetail(p, commits, runs, commitErr = "", pending = false) {
     }));
   document.querySelectorAll("[data-del]").forEach((el) =>
     el.addEventListener("click", async () => {
-      if (!confirm(`移除项目 ${el.dataset.name}？（审查记录一并删除）`)) return;
+      if (!await uiConfirm(`移除项目 ${el.dataset.name}？（审查记录一并删除）`)) return;
       await api(`/api/projects/${el.dataset.del}`, { method: "DELETE" });
       location.hash = "#/projects";
     }));
@@ -1464,9 +1485,9 @@ function findingsAreaHtml(run) {
       ? `<div class="sec-title">发现</div><div class="panel empty">无</div>` : "";
   }
   return `<div class="sec-title">发现（${imp.length} Important · ${nit.length} Nit · ${pre.length} Pre-existing）</div>
-    ${findingGroup(run, "Important —— 交叉确认，或门禁确认", imp, "imp")}
-    ${findingGroup(run, "Nit —— 单模型发现，未交叉验证", nit, "nit")}
-    ${findingGroup(run, "Pre-existing —— 非本次引入，不阻断", pre, "pre")}`;
+    ${findingGroup(run, "Important · 优先处理", imp, "imp")}
+    ${findingGroup(run, "Nit · 供参考", nit, "nit")}
+    ${findingGroup(run, "Pre-existing · 历史问题", pre, "pre")}`;
 }
 
 async function loadApprovals(run) {
@@ -1515,7 +1536,8 @@ function paintRunShell(run) {
       sub: `${TRIGGER_LABEL[run.trigger] || run.trigger}${run.pr_number ? ` · PR #${run.pr_number}` : ""}
         · ${shaLink(run.repo, run.head_sha)}
         ${run.tier ? ` · <span class="badge tier">风险 ${TIER_LABEL[run.tier] || esc(run.tier)}</span>` : ""}`,
-      actions: `<div class="actions" id="run-actions"></div>`,
+      actions: `<div class="actions"><a class="ghost small-btn run-workbench-link" href="#/workbench">返回质量工作台</a>
+        <div class="actions" id="run-actions"></div></div>`,
     })}
     <div id="banner-box">${runBannerHtml(run)}</div>
     <div id="approval-box"></div>
@@ -1555,7 +1577,7 @@ function patchRunDynamic(prev, fresh) {
       $a.innerHTML = html;
       const revertBtn = $("revert-btn");
       if (revertBtn) revertBtn.onclick = async () => {
-        if (!confirm("基于该 run 的 commit 创建回滚 PR？")) return;
+        if (!await uiConfirm("基于该 run 的 commit 创建回滚 PR？")) return;
         try {
           const r = await api(`/api/runs/${fresh.id}/revert`, { method: "POST" });
           toast(`回滚 PR 已创建：${r.pr_url}`);
@@ -1611,7 +1633,7 @@ function patchRunDynamic(prev, fresh) {
   if ($f && $f.innerHTML !== fHtml) $f.innerHTML = fHtml;
   const revertBtn = $("revert-btn");
   if (revertBtn && !revertBtn.onclick) revertBtn.onclick = async () => {
-    if (!confirm("基于该 run 的 commit 创建回滚 PR？")) return;
+    if (!await uiConfirm("基于该 run 的 commit 创建回滚 PR？")) return;
     try {
       const r = await api(`/api/runs/${fresh.id || prev.id}/revert`, { method: "POST" });
       toast(`回滚 PR 已创建：${r.pr_url}`);
@@ -1713,36 +1735,19 @@ function markButtonsHtml(run, f) {
        title="${cur === val ? "再点一次撤销标记" : "标记为" + label}">${cur === val ? "✓ " : ""}${label}</button>`;
   const evalBtn = (run.project_kind === "github" && f.severity === "IMPORTANT" && cur)
     ? `<button class="ghost small-btn" data-eval-run="${run.id}" data-eval-idx="${f._idx}"
-        title="存进评测集：确认=正例（应报出），误报=负例（不应再报出）；改提示词前跑回归">存为评测用例</button>` : "";
-  return `<div class="f-mark"><span class="f-key">处置</span>${btn("confirmed", "确认")}${btn("false_positive", "误报")}${evalBtn}</div>`;
+        title="确认=应报出样本；误报=不应再报样本">存为样本</button>` : "";
+  const ruleBtn = f.severity === "IMPORTANT" && cur === "false_positive"
+    ? `<button class="ghost small-btn" data-fb-run="${run.id}" data-fb-idx="${f._idx}"
+        data-fb-title="${esc(f.title)}" data-fb-file="${esc(f.file || "")}">加入不再报告规则</button>` : "";
+  return `${btn("confirmed", "确认")}${btn("false_positive", "误报")}${evalBtn}${ruleBtn}`;
 }
-
-/* 长文折叠：卡片保持紧凑，但永远有"展开全部"看完整内容 */
-function clampHtml(text, n = 160) {
-  if (!text) return "";
-  if (text.length <= n) return esc(text);
-  return `<span class="clamp-short">${esc(text.slice(0, n))}…<a href="javascript:void(0)" data-clamp class="small" style="margin-left:4px">展开全部</a></span>` +
-    `<span class="clamp-full" style="display:none">${esc(text)}<a href="javascript:void(0)" data-clamp class="small" style="margin-left:4px">收起</a></span>`;
-}
-document.addEventListener("click", (e) => {
-  const t = e.target.closest("[data-clamp]");
-  if (!t) return;
-  e.preventDefault();
-  e.stopPropagation();
-  const short = t.closest(".clamp-short, .clamp-full");
-  const wrap = short.parentElement;
-  const isShort = short.classList.contains("clamp-short");
-  wrap.querySelector(".clamp-short").style.display = isShort ? "none" : "";
-  wrap.querySelector(".clamp-full").style.display = isShort ? "" : "none";
-});
 
 /* 复制完整问题（标题/位置/触发/建议），发给改代码的人直接能看懂 */
 document.addEventListener("click", async (e) => {
   const b = e.target.closest("[data-copy-run]");
   if (!b) return;
   e.stopPropagation();
-  const run = runCache[+b.dataset.copyRun] ||
-    (wbState.run?.id === +b.dataset.copyRun ? wbState.run : null);
+  const run = runCache[+b.dataset.copyRun];
   const f = run && run.findings && run.findings[+b.dataset.copyIdx];
   if (!f) { toast("未取到该发现的完整内容（刷新页面后再试）", true); return; }
   const text = `【${f.severity === "IMPORTANT" ? "Important" : f.severity || "Nit"}】${f.title}\n`
@@ -1758,26 +1763,41 @@ document.addEventListener("click", async (e) => {
 
 function findingGroup(run, title, list, cls) {
   if (!list.length) return "";
-  return `<div class="sec-title" style="letter-spacing:.14em">${esc(title)}</div>
-  <div class="finding-grid">${list.map((f) => {
+  return `<div class="sec-title finding-group-title">${esc(title)} <span class="small">${list.length}</span></div>
+  <div class="panel finding-list">${list.map((f) => {
     const isGate = (f.sources || []).some((s) => String(s).startsWith("gate:"));
-    return `
-    <div class="panel finding f-${cls}">
-      <div class="f-head">
-        ${fileLink(run, f.file, f.line)}
-        <span class="f-src small muted">来源 ${esc((f.sources || []).join(" + "))}
-          <button class="ghost small-btn" data-copy-run="${run.id}" data-copy-idx="${f._idx}"
-            title="复制完整问题（标题/位置/触发/建议）—— 直接发给改代码的人">复制</button></span>
+    return `<article class="finding-row f-${cls}">
+      <div class="finding-row-main">
+        <div class="finding-row-info">
+          <div class="finding-row-title"><span class="finding-severity ${cls}">${esc(f.severity || "发现")}</span>
+            <strong title="${esc(f.title)}">${esc(f.title)}</strong>
+            ${f.disposition ? `<span class="badge ${f.disposition === "confirmed" ? "confirmed" : "fp"}">${f.disposition === "confirmed" ? "已确认" : "误报"}</span>` : ""}</div>
+          <div class="finding-row-meta">${fileLink(run, f.file, f.line)}
+            <span>${esc((f.sources || []).join(" + "))}</span></div>
+        </div>
+        <div class="finding-row-actions">
+          <button class="fr-copy" data-copy-run="${run.id}" data-copy-idx="${f._idx}"
+            title="复制标题、位置、触发条件和建议">复制</button>
+          ${isGate ? '<button class="ghost small-btn" data-goto-log>门禁日志</button>' : markButtonsHtml(run, f)}
+          <button class="ghost small-btn" data-finding-expand aria-expanded="false">查看全部</button>
+        </div>
       </div>
-      <div class="f-title">${clampHtml(f.title)}</div>
-      ${f.condition ? `<div class="f-row"><span class="f-key">触发</span>${clampHtml(f.condition, 200)}</div>` : ""}
-      ${f.fix ? `<div class="f-row"><span class="f-key">建议</span>${clampHtml(f.fix, 200)}</div>` : ""}
-      ${isGate
-        ? `<div class="f-mark"><span class="f-key">详情</span><button class="ghost small-btn" data-goto-log>查看门禁日志</button></div>`
-        : markButtonsHtml(run, f)}
-    </div>`;
+      <div class="finding-row-detail" hidden>
+        <div><span class="f-key">触发条件与影响</span><p>${esc(f.condition || "未提供")}</p></div>
+        <div><span class="f-key">建议修复</span><p>${esc(f.fix || "未提供")}</p></div>
+      </div>
+    </article>`;
   }).join("")}</div>`;
 }
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-finding-expand]");
+  if (!b) return;
+  const detail = b.closest(".finding-row").querySelector(".finding-row-detail");
+  const open = detail.hidden;
+  detail.hidden = !open;
+  b.setAttribute("aria-expanded", String(open));
+  b.textContent = open ? "收起" : "查看全部";
+});
 
 /* ---------------- 配置中心 ---------------- */
 
@@ -1943,6 +1963,16 @@ async function refreshEvalLive() {
   try { d = await api("/api/eval/last"); }
   catch (e) { return false; }
   const running = d.history.length && d.history[0].status === "running";
+  if (location.hash === "#/workbench" && qualityData) {
+    qualityData.eval = d;
+    const status = $("qa-eval-status"), details = $("qa-details");
+    if (status) status.innerHTML = qualityEvalHtml(qualityData);
+    if (details && !details.hidden) details.innerHTML = qualityDetailsHtml(qualityData);
+    bindQualityActions();
+    document.querySelectorAll("[data-qa-toggle]").forEach((b) =>
+      b.setAttribute("aria-expanded", String(!!details && !details.hidden)));
+    return running;
+  }
   const btn = $("eval-run");
   if (btn) { btn.disabled = running; btn.textContent = running ? "跑分进行中…" : "跑一轮评测"; }
   const latest = $("eval-latest");
@@ -2060,7 +2090,7 @@ async function renderSettings(tab = "pipeline") {
     <div class="sec-title">评审规则</div>
     <div class="panel stagger" style="padding:18px 20px">
       <textarea id="rules-ta" class="profile-edit" rows="12">${esc(prompt.rules)}</textarea>
-      <div class="hint" title="每次线上事故后加一条「已知陷阱」；处置页里反复误报的模式写进「一律不报」">事故回流写这里（REVIEW.md）</div>
+      <div class="hint" title="每次线上事故后加一条「已知陷阱」；反复误报的模式写进「一律不报」">把事故教训写成评审规则（REVIEW.md）</div>
       <div class="actions" style="margin-top:10px">
         <button class="primary" id="rules-save">保存规则</button>
       </div>
@@ -2149,7 +2179,8 @@ async function renderSettings(tab = "pipeline") {
     catch (e) { toast(e.message, true); }
   });
   document.querySelectorAll("[data-c-rotate]").forEach((b) => b.onclick = async () => {
-    const token = prompt("输入新的 GitHub Token（原 token 将立即失效）：");
+    const token = await uiPrompt("更换 GitHub Token",
+      { message: "保存后原 token 立即失效。", type: "password" });
     if (!token) return;
     try { await api(`/api/github-connections/${b.dataset.cRotate}/token`, {method: "PUT", body: {token}}); toast("token 已更换"); renderSettings("creds"); }
     catch (e) { toast(e.message, true); }
@@ -2159,7 +2190,7 @@ async function renderSettings(tab = "pipeline") {
     catch (e) { toast(e.message, true); }
   });
   document.querySelectorAll("[data-c-delete]").forEach((b) => b.onclick = async () => {
-    if (!confirm("删除此连接？")) return;
+    if (!await uiConfirm("删除此连接？")) return;
     try { await api(`/api/github-connections/${b.dataset.cDelete}`, {method: "DELETE"}); renderSettings("creds"); }
     catch (e) { toast(e.message, true); }
   });
@@ -2297,7 +2328,7 @@ async function mountConfigHistory(containerId, key, onRestored) {
     el.innerHTML = configHistoryHtml(d.versions);
     el.querySelectorAll("[data-restore]").forEach((b) =>
       (b.onclick = async () => {
-        if (!confirm("恢复到这个版本？当前生效配置将被覆盖")) return;
+        if (!await uiConfirm("恢复到这个版本？当前生效配置将被覆盖")) return;
         try {
           const r = await api(`/api/config/versions/${b.dataset.restore}/restore`, { method: "POST" });
           toast(`已恢复（${r.key === "rules" ? "评审规则" : r.key === "pipeline" ? "全局流水线"
@@ -2370,7 +2401,7 @@ async function renderProjectPipeline(pid) {
   mountConfigHistory("hist-ppipeline", `project_pipeline:${pid}`, () => renderProjectPipeline(pid));
   const inheritBtn = $("pp-inherit");
   if (inheritBtn) inheritBtn.onclick = async () => {
-    if (!confirm("恢复后此项目将跟随全局默认编排（删除独立编排）？")) return;
+    if (!await uiConfirm("恢复后此项目将跟随全局默认编排（删除独立编排）？")) return;
     try {
       await api(`/api/projects/${pid}/pipeline`, { method: "DELETE" });
       toast("已恢复跟随全局默认");
