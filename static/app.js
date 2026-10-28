@@ -355,7 +355,7 @@ function updateHealth() {
 }
 
 function runTable(runs, withProject) {
-  if (!runs.length) return `<div class="empty">还没有审查记录 —— 到「项目」里接入仓库，新 push / PR 会自动审查</div>`;
+  if (!runs.length) return `<div class="empty">还没有审查记录 —— 到「项目」里接入仓库，默认分支的新 push 会自动审查</div>`;
   return `<table><thead><tr>
       <th style="width:118px">状态</th>
       ${withProject ? "<th>项目</th>" : ""}
@@ -1074,7 +1074,7 @@ function projectCard(p) {
       <div class="grow">
         <div class="name">${esc(p.name)}
           ${p.kind === "local" ? `<span class="badge">本地</span>` : ""}
-          ${p.auto_revert ? `<span class="badge">自动回滚</span>` : ""}
+          ${p.auto_revert ? `<span class="badge" title="当前默认分支 push 工作流尚未接入自动回滚">自动回滚未接入</span>` : ""}
           ${p.webhook_attached ? `<span class="badge">webhook 已挂</span>` : ""}
           ${initChip}
         </div>
@@ -1118,8 +1118,8 @@ function showAddForm() {
       <input id="f-target" placeholder="your-org/your-repo"></div>
     <div class="form-row">
       <div class="field"><label>默认分支</label><input id="f-branch" value="main"></div>
-      <div class="field"><label>合并后评审发现 Important 时自动回滚</label>
-        <select id="f-autorevert"><option value="no">关闭（回滚走按钮）</option><option value="yes">开启</option></select></div>
+      <div class="field"><label>自动回滚（当前工作流未接入）</label>
+        <select id="f-autorevert"><option value="no">关闭（可在报告中手动回滚）</option><option value="yes" disabled>后续接入</option></select></div>
     </div>
     <div class="field" id="f-connection-wrap"><label>GitHub 连接</label>
       <select id="f-connection">${connectionOptions()}</select>
@@ -1265,7 +1265,7 @@ function paintProjectDetail(p, commits, runs, commitErr = "", pending = false) {
       back: { label: "返回项目列表", hash: "#/projects" },
       crumbs: `项目 / ${esc(p.name)}`,
       title: `${esc(p.name)} ${p.kind === "local" ? `<span class="badge">本地</span>` : ""}
-        ${p.auto_revert ? `<span class="badge">自动回滚</span>` : ""} ${initChip}
+        ${p.auto_revert ? `<span class="badge" title="当前默认分支 push 工作流尚未接入自动回滚">自动回滚未接入</span>` : ""} ${initChip}
         ${p.enabled ? "" : `<span class="badge imp">已停用</span>`}`,
       sub: `<a href="https://github.com/${esc(p.full_name)}" target="_blank">${esc(p.full_name)}</a> · ${esc(p.default_branch)}`,
       actions: `<button class="primary" data-run-now="${p.id}">立即审查 HEAD</button>
@@ -1431,7 +1431,7 @@ async function renderRun(id, silent) {
 function runBannerHtml(run) {
   return {
     passed: `<div class="banner passed"><span class="mark"></span><div><b>通过</b> —— 未发现会导致线上问题的事项</div></div>`,
-    blocked: `<div class="banner blocked"><span class="mark"></span><div><b>发现问题</b> —— ${run.important_count} 个 Important；${run.revert_pr_url ? `已自动创建回滚 PR：<a href="${esc(run.revert_pr_url)}" target="_blank">${esc(run.revert_pr_url)}</a>` : "处理完再合入，或对本 run 执行回滚"}</div></div>`,
+    blocked: `<div class="banner blocked"><span class="mark"></span><div><b>发现问题</b> —— ${run.important_count} 个 Important；${run.revert_pr_url ? `已自动创建回滚 PR：<a href="${esc(run.revert_pr_url)}" target="_blank">${esc(run.revert_pr_url)}</a>` : "请修复发现；已进入默认分支的变更可按需创建回滚 PR"}</div></div>`,
     failed: `<div class="banner failed"><span class="mark"></span><div><b>执行失败</b> —— ${esc(run.error || "未知错误")}（引擎异常不会判定通过）
       <div class="failure-triage-state">${run.failure_action === "handled" ? `✓ 已标记处理 · ${fmtTime(run.failure_at)}${run.failure_note ? ` · ${esc(run.failure_note)}` : ""}`
         : "仍在工作台待处理；标记处理只移出待办，不会把这次审查改为通过。"}</div>

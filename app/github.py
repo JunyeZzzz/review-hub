@@ -129,7 +129,7 @@ def attach_webhook(full_name: str, hub_url: str, *, token: str | None = None) ->
     if config.WEBHOOK_SECRET:
         cfg["secret"] = config.WEBHOOK_SECRET
     r = gh("POST", f"/repos/{full_name}/hooks", token=token, json={
-        "name": "web", "active": True, "events": ["push", "pull_request"], "config": cfg,
+        "name": "web", "active": True, "events": ["push"], "config": cfg,
     })
     return r.json()
 

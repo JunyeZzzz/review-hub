@@ -64,15 +64,17 @@ INIT_PROMPT = """根据下面的仓库信息，用**不超过 3 句中文**概�
 MAX_DIFF_LINES = 8000
 
 
-def build(workdir: Path, intent: str = "", profile: str = "") -> dict:
-    """生成 diff 与 prompt 文件。intent = commit message / PR 描述；profile = 项目画像。"""
+def build(workdir: Path, intent: str = "", profile: str = "", diff_spec: str = "") -> dict:
+    """生成 diff 与 prompt 文件；提供 diff_spec 时必须严格使用该审查区间。"""
     base = f"origin/{_default_branch(workdir)}"
     diff_result = subprocess.run(
-        ["git", "diff", f"{base}...HEAD"], cwd=workdir,
+        ["git", "diff", diff_spec or f"{base}...HEAD"], cwd=workdir,
         capture_output=True, text=True,
     )
+    if diff_spec and diff_result.returncode:
+        raise RuntimeError(f"无法取得审查区间 {diff_spec}：{diff_result.stderr[-400:]}")
     diff = diff_result.stdout if diff_result.returncode == 0 else ""
-    if not diff.strip():
+    if not diff_spec and not diff.strip():
         # 本地仓库可能没有 origin：退回比较上一次提交
         fallback = subprocess.run(
             ["git", "diff", "HEAD~1...HEAD"], cwd=workdir,

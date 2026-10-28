@@ -1,4 +1,4 @@
-"""后台 worker：消费 runs 队列，执行审查流水线；另有轮询器发现新 push/PR。"""
+"""后台 worker：消费 runs 队列，执行审查流水线；另有轮询器发现默认分支的新 push。"""
 import json
 import fcntl
 import os
@@ -284,7 +284,13 @@ def _diff_range(workdir: Path, run: dict, project: dict) -> tuple[str, str]:
     if run["trigger"] == "pr" and run["head_sha"]:
         return f"origin/{project['default_branch']}", run["head_sha"]
     head = run["head_sha"] or "HEAD"
+    if run["trigger"] == "push" and run["base_ref"]:
+        return run["base_ref"], head
     parents = _git(workdir, "rev-list", "--parents", "-n", "1", head).stdout.split()
+    if len(parents) == 1:
+        empty = subprocess.run(["git", "hash-object", "-t", "tree", "--stdin"],
+                               cwd=workdir, input="", capture_output=True, text=True, check=True)
+        return empty.stdout.strip(), head
     base = f"{head}~1" if len(parents) == 2 else f"{head}^1"
     return base, head
 
@@ -333,6 +339,7 @@ def _process_run(run, project) -> None:
     try:
         workdir = _prepare(project, run, sl)
         base_ref, head_ref = _diff_range(workdir, run, project)
+        diff_spec = f"{base_ref}{'...' if run['trigger'] == 'pr' else '..'}{head_ref}"
 
         # 变更上下文：分支 / 提交 / 作者 / commitmsg / 增删行数 / 变更声明目的
         t0 = sl.start("变更上下文")
@@ -350,7 +357,7 @@ def _process_run(run, project) -> None:
             except Exception as e:
                 print(f"[hub] PR 信息获取失败：{e}")
         additions = deletions = 0
-        for line in _git(workdir, "diff", "--numstat", f"{base_ref}...{head_ref}").stdout.splitlines():
+        for line in _git(workdir, "diff", "--numstat", diff_spec).stdout.splitlines():
             p = line.split("\t")
             if len(p) >= 2:
                 if p[0].isdigit():
@@ -366,10 +373,10 @@ def _process_run(run, project) -> None:
 
         # 风险路由
         t0 = sl.start("风险路由")
-        diff_files = _git(workdir, "diff", "--name-only", f"{base_ref}...{head_ref}").stdout.splitlines()
+        diff_files = _git(workdir, "diff", "--name-only", diff_spec).stdout.splitlines()
         # 完整 diff 落库（报告页可查，评审对象本体）
         db.execute("UPDATE runs SET diff_text=? WHERE id=?",
-                   (_git(workdir, "diff", f"{base_ref}...{head_ref}").stdout[:200000], run_id))
+                   (_git(workdir, "diff", diff_spec).stdout[:200000], run_id))
         changed_lines = additions + deletions
         tier_info = router.classify(diff_files, changed_lines)
         db.execute("UPDATE runs SET tier=?, files_changed=? WHERE id=?",
@@ -410,7 +417,8 @@ def _process_run(run, project) -> None:
                     return   # 门禁红灯已收尾（fail loud），后续步骤不再执行
                 continue
             if built is None:
-                built = prompts.build(workdir, intent=intent, profile=project["profile"] or "")
+                built = prompts.build(workdir, intent=intent, profile=project["profile"] or "",
+                                      diff_spec=diff_spec)
             diff_text = built["diff_file"].read_text(encoding="utf-8")
             if step.get("kind") == "review":
                 reviewers_out.extend(_run_review_group(step, project, workdir, built, diff_text, prior, sl))
@@ -444,7 +452,7 @@ def _process_run(run, project) -> None:
         db.execute("UPDATE runs SET status=?, important_count=?, summary=?, finished_at=?, duration_ms=? WHERE id=?",
                    (status, merged["important_count"], merged["summary"], db.now(), _duration(run_id), run_id))
 
-        # GitHub 写回 + 合并后自动回滚
+        # GitHub 写回；旧 merged 类型仍保留原有自动回滚处理。
         if project["kind"] == "github":
             _github_followup(project, run, merged, status)
     except Exception as e:
@@ -517,7 +525,7 @@ def _duration(run_id: int) -> int:
 
 
 def _github_followup(project: dict, run: dict, merged: dict, status: str) -> None:
-    """评论写回 + merged 触发时的自动回滚。失败只记 error，不影响 run 状态。"""
+    """评论写回 + 旧 merged 类型的自动回滚；失败只记 error，不影响 run 状态。"""
     try:
         if run["pr_number"]:
             body = _comment_markdown(run, merged, status)
@@ -583,7 +591,6 @@ def poll_loop() -> None:
 
 def _poll_once() -> None:
     projects = db.query("SELECT * FROM projects WHERE kind='github' AND enabled=1")
-    since = time.time() - config.POLL_INTERVAL * 2 - 60
     errors = []
     for p in projects:
         full = p["full_name"]
@@ -594,12 +601,10 @@ def _poll_once() -> None:
                 # 首次见到该仓库：只记基线，不审查
                 db.execute("UPDATE projects SET last_sha=? WHERE id=?", (sha, p["id"]))
             elif sha != p["last_sha"]:
-                if enqueue(p["id"], "push", ref=p["default_branch"], head_sha=sha):
-                    db.execute("UPDATE projects SET last_sha=? WHERE id=?", (sha, p["id"]))
+                enqueue(p["id"], "push", ref=p["default_branch"],
+                        base_ref=p["last_sha"], head_sha=sha)
+                db.execute("UPDATE projects SET last_sha=? WHERE id=?", (sha, p["id"]))
             prefetch_commits(p)
-            for pr in github.open_pulls(full, since, token=token):
-                enqueue(p["id"], "pr", ref=f"pr-{pr['number']}",
-                        head_sha=pr["head"]["sha"], pr_number=pr["number"])
         except Exception as e:
             print(f"[hub] 轮询 {full} 失败：{e}")
             errors.append(f"{full}: {e}")

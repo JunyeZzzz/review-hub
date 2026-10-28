@@ -2,6 +2,7 @@
 import hmac
 import json
 import os
+import re
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -443,12 +444,12 @@ class ProjectIn(BaseModel):
 
 
 def _upsert_project(p: ProjectIn) -> int:
+    if p.auto_revert:
+        raise HTTPException(400, "自动回滚尚未接入默认分支 push 工作流；可在审查报告中手动创建回滚 PR")
     if p.kind == "github":
         connections.validate_id(p.github_connection_id)
     elif p.github_connection_id is not None:
         raise HTTPException(400, "本地项目不能绑定 GitHub 连接")
-    if p.auto_revert and p.github_connection_id is None:
-        raise HTTPException(400, "自动回滚需要先绑定 GitHub 连接")
     full = p.full_name.strip().rstrip("/").removeprefix("https://github.com/").removesuffix(".git")
     if p.kind == "local":
         full = str(Path(full).expanduser().resolve())
@@ -536,11 +537,10 @@ def update_project(pid: int, body: dict):
     if not current:
         raise HTTPException(404, "项目不存在")
     effective_cid = body.get("github_connection_id", current["github_connection_id"])
-    effective_revert = body.get("auto_revert", current["auto_revert"])
+    if body.get("auto_revert"):
+        raise HTTPException(400, "自动回滚尚未接入默认分支 push 工作流；可在审查报告中手动创建回滚 PR")
     if current["kind"] == "local" and effective_cid is not None:
         raise HTTPException(400, "本地项目不能绑定 GitHub 连接")
-    if effective_revert and effective_cid is None:
-        raise HTTPException(400, "自动回滚需要先绑定 GitHub 连接")
     if "github_connection_id" in body and current["kind"] == "github":
         try:
             github.repo_info(current["full_name"], token=connections.token_for_id(effective_cid))
@@ -1153,12 +1153,12 @@ async def github_webhook(request: Request):
         ref = (data.get("ref") or "").removeprefix("refs/heads/")
         if ref == p["default_branch"] and not data.get("deleted"):
             after = data.get("after", "")
-            if after and after != p["last_sha"]:
-                if worker.enqueue(p["id"], "push", ref=ref, head_sha=after):
-                    db.execute("UPDATE projects SET last_sha=? WHERE id=?", (after, p["id"]))
-    elif event == "pull_request":
-        action, pr = data.get("action"), data.get("pull_request", {})
-        if action in ("opened", "synchronize", "ready_for_review"):
-            worker.enqueue(p["id"], "pr", head_sha=pr["head"]["sha"], pr_number=pr["number"])
-        # 合并后分析暂时关闭（按要求）：closed+merged 事件直接忽略
+            before = data.get("before", "")
+            valid = lambda sha: isinstance(sha, str) and re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", sha)
+            if valid(after) and valid(before) and after != p["last_sha"] \
+                    and (not p["last_sha"] or before == p["last_sha"]):
+                base = "" if set(before) == {"0"} else before
+                worker.enqueue(p["id"], "push", ref=ref, base_ref=base, head_sha=after)
+                db.execute("UPDATE projects SET last_sha=? WHERE id=?", (after, p["id"]))
+    # PR 打开、更新、关闭均不触发：合并进入默认分支会产生 push 事件。
     return {"ok": True}
