@@ -1,0 +1,49 @@
+# 风险分级规则：路径 -> 风险等级 -> 门禁行为
+# 这份文件是整个体系的"风险分类器"，由 scripts/policy_router.py 消费。
+# 改这里就能改变全公司的门禁行为，不需要动任何 workflow 代码。
+
+version: 1
+
+defaults:
+  # 命中 high.paths 之前，diff 行数 >= medium_min_changed_lines 时升级为 medium
+  base_tier: low
+  medium_min_changed_lines: 400
+
+tiers:
+  # 全部改动都命中 trivial.paths -> trivial（跳过 AI review，省额度）
+  trivial:
+    paths:
+      - "**/*.md"
+      - "docs/**"
+      - "**/*.txt"
+      - "**/*.svg"
+
+  # 命中任意一条 -> high（AI review Important 阻断 + 必须人工批准，见 CODEOWNERS）
+  high:
+    paths:
+      - ".github/workflows/**"
+      - ".github/CODEOWNERS"
+      - "**/auth/**"
+      - "**/payment*/**"
+      - "**/billing/**"
+      - "**/permission*/**"
+      - "migrations/**"
+      - "**/migrations/**"
+      - "infra/**"
+      - "**/Dockerfile*"
+      - "**/docker-compose*.yml"
+
+ai_review:
+  # 这些等级跳过 AI review（省订阅额度）
+  skip_for: [trivial]
+  # 这些等级下，AI review 报出 Important 时直接红灯挡合并
+  block_on_important:
+    low: false
+    medium: true
+    high: true
+  # 评论里最多展开多少条（防止刷屏）
+  max_findings_shown: 20
+
+review_cycles:
+  # 收敛控制：同一 PR 最多几轮 review（配合"重审只看新 diff"使用）
+  max: 3
