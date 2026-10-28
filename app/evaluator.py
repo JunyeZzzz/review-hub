@@ -2,7 +2,7 @@
 
 范围与规则：
 - 用例来自报告页的人工处置：确认的 Important = 正例（应报出）；误报 = 负例（不应再报出）；
-- 按当前生效编排运行节点；门禁不计入命中率，但其结果进入后续节点上下文；
+- 按当前生效编排运行节点；门禁只决定是否继续，评审组成员独立使用同一份上游上下文；
 - 命中判定与裁决层同一把尺子（verdict.similar：同文件 ±15 行 + 标题相似度）；
 - 后台线程跑，逐用例落库进度；同一时间只允许一轮评测。
 """
@@ -21,16 +21,21 @@ _eval_lock = threading.Lock()
 
 def _config_snapshot() -> str:
     def signature(steps):
+        def semantic_step(step):
+            if step.get("kind") != "review":
+                return step
+            return {**step, "reviewers": sorted(step.get("reviewers", []), key=lambda m: m.get("id", ""))}
         return [f"{s.get('id')}:{s.get('kind')}:{s.get('gate') or s.get('provider') or s.get('credential_id')}:"
                 f"{s.get('model')}:{s.get('purpose','findings')}:"
-                f"{hashlib.sha256(json.dumps(s, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:10]}"
+                f"{hashlib.sha256(json.dumps(semantic_step(s), sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:10]}"
                 for s in steps if s.get("enabled", True)]
     project_ids = [r["project_id"] for r in db.query("SELECT DISTINCT project_id FROM eval_cases ORDER BY project_id")]
     global_steps = worker.get_pipeline()
     project_steps = {str(pid): worker.get_pipeline(db.get("SELECT * FROM projects WHERE id=?", (pid,)))
                      for pid in project_ids if db.get("SELECT id FROM projects WHERE id=?", (pid,))}
-    used_credentials = {s.get("credential_id") for steps in [global_steps, *project_steps.values()]
-                        for s in steps if s.get("kind") == "api"}
+    used_credentials = {node.get("credential_id") for steps in [global_steps, *project_steps.values()]
+                        for step in steps for node in ([step, *step.get("reviewers", [])])
+                        if node.get("kind") == "api"}
     credentials = {str(r["id"]): r["updated_at"] for r in db.query(
         "SELECT id,updated_at FROM model_credentials ORDER BY id") if r["id"] in used_credentials}
     return json.dumps({
@@ -106,18 +111,22 @@ def _run_case(case: dict) -> dict:
                     gate_result = gates.run_build(workdir, **kw)
                 else:
                     gate_result = gates.run_tests(workdir, **kw)
-                prior.append({"name": step.get("name") or "门禁", "status": gate_result["status"],
-                              "output": gate_result.get("log", "")})
                 if gate_result["status"] == "fail":
                     raise RuntimeError(f"评测门禁失败：{step.get('name') or gtype}")
+                continue
+            if step.get("kind") == "review":
+                for member in step.get("reviewers", []):
+                    if not member.get("enabled", True):
+                        continue
+                    text, _, _ = worker._run_reviewer_step(member, project, workdir, built, diff_text, prior)
+                    name = member.get("name") or member.get("id", "评审")
+                    if verdict.extract_findings(text) is None:
+                        raise RuntimeError(f"{name} 未返回有效 findings JSON")
+                    outs.append((name, text))
                 continue
             text, _, _ = worker._run_reviewer_step(step, project, workdir, built, diff_text, prior)
             name = step.get("name") or step.get("id", "评审")
             prior.append({"name": name, "status": "ok", "output": text})
-            if step.get("purpose", "findings") == "findings":
-                if verdict.extract_findings(text) is None:
-                    raise RuntimeError(f"{name} 未返回有效 findings JSON")
-                outs.append((name, text))
         merged = verdict.merge_multi(outs)
     except Exception as e:
         return {**base, "result": "error", "detail": str(e)[-300:]}

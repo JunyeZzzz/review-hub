@@ -33,10 +33,14 @@ def _norm(f: dict, src: str) -> dict:
     sev = str(f.get("severity", "Nit")).upper()
     if sev not in {"IMPORTANT", "NIT", "PRE-EXISTING"}:
         sev = "NIT"
+    try:
+        line = int(f.get("line") or 0)
+    except (TypeError, ValueError):
+        line = 0
     return {
         "severity": sev,
         "file": str(f.get("file", "")).lstrip("./"),
-        "line": f.get("line", 0) or 0,
+        "line": line,
         "title": str(f.get("title", "")).strip(),
         "condition": str(f.get("condition", "")).strip(),
         "fix": str(f.get("fix", "")).strip(),
@@ -65,6 +69,9 @@ def merge_multi(reviews: list) -> dict:
             if isinstance(f, dict):
                 findings.append(_norm(f, src))
 
+    # 组内摆放只控制执行先后。固定合并遍历顺序，避免相似度非传递时
+    # 先完成的评审器改变最终聚类和严重度。
+    findings.sort(key=lambda f: (f["file"], int(f["line"] or 0), _title_key(f), f["sources"][0]))
     merged: list = []
     for f in findings:
         hit = None
@@ -94,7 +101,7 @@ def merge_multi(reviews: list) -> dict:
     merged.sort(key=lambda f: order.get(f["severity"], 1))
     imp = sum(1 for f in merged if f["severity"] == "IMPORTANT")
     parts = []
-    for src, text in reviews:
+    for src, text in sorted(reviews, key=lambda item: item[0]):
         if extract_findings(text) is None:
             parts.append(f"{src} 无有效输出")
     parts.append(f"Important {imp} / 共 {len(merged)} 条")

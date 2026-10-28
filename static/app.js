@@ -1461,10 +1461,12 @@ function runPipelineHtml(run) {
     ? '<span class="badge confirmed">项目编排生效</span>' : '<span class="badge">全局默认</span>';
   const byName = new Map((run.steps || []).map((s) => [s.name, s]));
   let done = 0;
-  const chips = (snap.steps || []).map((s, i) => {
+  const visibleSteps = (snap.steps || []).flatMap((s) => s.kind === "review"
+    ? (s.reviewers || []).filter((m) => m.enabled !== false).map((m) => ({ ...m, group: s.name || "交叉评审" })) : [s]);
+  const chips = visibleSteps.map((s, i) => {
     const meta = s.kind === "gate"
       ? `${GATE_LABEL[s.gate] || s.gate}${s.sandbox === "docker" ? " · Docker" : " · 本机"}`
-      : `${s.kind === "api" ? "模型 API" : s.provider}${s.model ? " · " + s.model : ""}${s.purpose === "context" ? " · 上下文" : ""}`;
+      : `${s.group ? "交叉评审 · " : "上下文 · "}${s.kind === "api" ? "模型 API" : s.provider}${s.model ? " · " + s.model : ""}`;
     const st = byName.get(s.name || s.id);
     const status = st ? st.status : "pending";
     if (status === "ok" || status === "fail" || status === "skip") done++;
@@ -1474,7 +1476,7 @@ function runPipelineHtml(run) {
       : status === "running" ? "mock" : "";
     return `<span class="badge ${cls}" title="${esc(meta)}">${mark} ${i + 1}. ${esc(s.name || s.id)}</span>`;
   });
-  const total = (snap.steps || []).length;
+  const total = visibleSteps.length;
   const progress = `<span class="muted small mono">${done}/${total}</span>`;
   return `<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">${src}${chips.join(" ")}${progress}</div>`;
 }
@@ -2034,7 +2036,7 @@ async function renderSettings(tab = "pipeline") {
         <button class="ghost" id="pipe-reset">恢复默认</button>
         <button class="primary" id="pipe-save">保存全局默认</button>
       </div>
-      <div class="hint">风险路由和密钥扫描在节点之前执行；产出发现的节点参与最终裁决。门禁失败会停止执行。</div>
+      <div class="hint">门禁失败直接打回；上下文节点供评审读取；评审组内部互不传递结果，最后统一裁决。</div>
     </div>
     <div class="sec-title stagger">修改历史 <span class="faint small mono" style="letter-spacing:0;text-transform:none">每次保存自动留档 · 可一键恢复</span></div>
     <div class="panel stagger" style="padding:4px 18px" id="hist-pipeline"></div>`;
@@ -2046,8 +2048,10 @@ async function renderSettings(tab = "pipeline") {
     $("pipe-reset").onclick = () => {
       draft.splice(0, draft.length,
         { id: "gate-test", kind: "gate", name: "测试门禁", gate: "tests", enabled: true },
-        { id: "claude", kind: "reviewer", name: "Claude 评审", provider: "claude", enabled: true, model: "", prompt: "" },
-        { id: "kimi", kind: "reviewer", name: "Kimi 评审", provider: "codex", enabled: true, model: "", prompt: "" });
+        { id: "cross-review", kind: "review", name: "交叉评审", enabled: true, reviewers: [
+          { id: "claude", kind: "reviewer", name: "Claude 评审", provider: "claude", enabled: true, model: "", prompt: "", purpose: "findings" },
+          { id: "kimi", kind: "reviewer", name: "Kimi 评审", provider: "codex", enabled: true, model: "", prompt: "", purpose: "findings" },
+        ] });
       paint();
     };
     $("pipe-save").onclick = async () => {
@@ -2416,7 +2420,7 @@ async function renderProjectPipeline(pid) {
       <div class="actions" style="margin-top:12px">
         <button id="pp-add">+ 添加节点</button>
       </div>
-      <div class="hint">只影响此项目；每个模型节点读取本次审查里此前所有节点的最终输出。</div>
+      <div class="hint">只影响此项目；门禁直接打回，上下文节点给交叉评审组提供输入，组内评审器互不读取结果。</div>
     </div>
 
     <div class="sec-title stagger">修改历史 <span class="faint small mono" style="letter-spacing:0;text-transform:none">此项目编排 · 每次保存自动留档</span></div>
@@ -2462,19 +2466,35 @@ const GATE_TIP = "机械门禁：失败即红灯阻断，不调用模型；仓�
 const SANDBOX_TIP = "本机=白名单环境变量执行（token 不进子进程）；Docker=一次性容器，断网+CPU/内存上限+依赖缓存卷，多项目并发互不影响。选 Docker 需本机装 Docker，缺失时该门禁红灯";
 
 let nodeCredentials = [];
-const NODE_KIND = { gate: "门禁", reviewer: "Agent", api: "模型 API" };
-const NODE_PURPOSE = { findings: "产出审查发现", context: "提供后续上下文" };
+const NODE_KIND = { gate: "门禁", reviewer: "Agent", api: "模型 API", review: "交叉评审" };
+const NODE_PURPOSE = { findings: "独立评审", context: "提供上游上下文" };
 function newPipeNode(kind, index) {
   const base = { id: `node-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     kind, name: `${NODE_KIND[kind]}节点 ${index}`, enabled: true };
   if (kind === "gate") return { ...base, gate: "tests", sandbox: "off", network: "install", image: "" };
   if (kind === "api") return { ...base, credential_id: nodeCredentials.find((c) => !c.disabled)?.id || null,
-    model: "", purpose: "findings", prompt: "" };
-  return { ...base, provider: "claude", model: "", purpose: "findings", prompt: "" };
+    model: "", purpose: "context", prompt: "" };
+  return { ...base, provider: "claude", model: "", purpose: "context", prompt: "" };
 }
 function pipeListHTML(draft) {
-  return `<div class="node-flow-intro">按顺序执行 · 每个模型节点都读取此前全部节点的最终输出 · 失败会停止后续节点</div>
+  return `<div class="node-flow-intro">门禁决定是否继续 → 可选的 LLM 上下文 → 交叉评审独立判断</div>
     ${draft.map((s, i) => {
+      if (s.kind === "review") return `<div class="node-flow-item"><div class="review-stage">
+        <div class="review-stage-head"><div><span class="node-kind review">交叉评审</span><strong>${esc(s.name || "交叉评审")}</strong>
+          <small>各评审器拿到同一份上游上下文；排列只决定执行顺序，不传递彼此的结论</small></div>
+          <button class="ghost small-btn" data-member-add>+ 添加评审器</button></div>
+        <span class="review-scroll-hint">左右滑动查看评审器 →</span><div class="review-members">${(s.reviewers || []).map((m, j) => {
+          const cred = nodeCredentials.find((c) => c.id === m.credential_id);
+          const detail = m.kind === "api" ? `${cred ? esc(cred.label) : "未绑定凭证"} · ${esc(m.model || "未填模型")}`
+            : `${m.provider === "codex" ? "Kimi / Codex" : "Claude Code"} · ${esc(m.model || "默认模型")}`;
+          return `<div class="review-member ${m.enabled ? "" : "off"}"><div class="review-member-top"><span class="node-kind ${m.kind}">${NODE_KIND[m.kind]}</span><span class="mono small muted">${j + 1}</span></div>
+            <strong>${esc(m.name || "未命名评审器")}</strong><small>${detail}</small>
+            <div class="review-member-actions"><label title="启用 / 停用"><input type="checkbox" data-member-en="${j}" ${m.enabled ? "checked" : ""}></label>
+              <button class="ghost small-btn" data-member-left="${j}" ${j ? "" : "disabled"} title="提前执行">←</button>
+              <button class="ghost small-btn" data-member-right="${j}" ${j < s.reviewers.length - 1 ? "" : "disabled"} title="稍后执行">→</button>
+              <button class="ghost small-btn" data-member-edit="${j}">配置</button>
+              <button class="danger-ghost small-btn" data-member-del="${j}">删除</button></div></div>`;
+        }).join("")}</div></div></div>`;
       const cred = nodeCredentials.find((c) => c.id === s.credential_id);
       const detail = s.kind === "gate" ? `${GATE_LABEL[s.gate] || s.gate} · ${s.sandbox === "docker" ? "Docker 沙盒" : "本机隔离"}`
         : s.kind === "api" ? `${cred ? esc(cred.label) : "未绑定凭证"} · ${esc(s.model || "未填模型")}`
@@ -2482,14 +2502,14 @@ function pipeListHTML(draft) {
       return `<div class="node-flow-item"><div class="pipe-step ${s.enabled ? "" : "off"}" data-idx="${i}">
         <div class="node-order"><span class="pipe-handle" draggable="true" data-drag="${i}" title="拖动调整顺序">⠿</span><b>${i + 1}</b></div>
         <div class="node-body"><div class="node-title"><span class="node-kind ${s.kind}">${NODE_KIND[s.kind] || esc(s.kind)}</span>
-          <strong>${esc(s.name || "未命名节点")}</strong>${s.kind !== "gate" ? `<span class="node-purpose">${NODE_PURPOSE[s.purpose || "findings"]}</span>` : ""}</div>
+          <strong>${esc(s.name || "未命名节点")}</strong>${s.kind !== "gate" ? `<span class="node-purpose">${NODE_PURPOSE.context}</span>` : ""}</div>
           <div class="node-description">${detail}</div></div>
         <div class="node-actions"><label title="启用 / 停用"><input type="checkbox" data-en="${i}" ${s.enabled ? "checked" : ""}></label>
           <button class="ghost small-btn" data-up="${i}" ${i ? "" : "disabled"} title="上移">↑</button>
-          <button class="ghost small-btn" data-down="${i}" ${i < draft.length - 1 ? "" : "disabled"} title="下移">↓</button>
+          <button class="ghost small-btn" data-down="${i}" ${i < draft.length - 2 ? "" : "disabled"} title="下移">↓</button>
           <button class="ghost small-btn" data-edit="${i}">配置</button>
           <button class="danger-ghost small-btn" data-del="${i}" title="从草稿删除节点">删除</button></div>
-      </div>${i < draft.length - 1 ? '<div class="node-connector"><span>完整上下文 ↓</span></div>' : ""}</div>`;
+      </div>${i < draft.length - 1 ? `<div class="node-connector"><span>${s.kind === "gate" ? "通过后继续 ↓" : "上游 LLM 上下文 ↓"}</span></div>` : ""}</div>`;
     }).join("")}`;
 }
 function nodeField(label, input, hint = "") {
@@ -2511,14 +2531,12 @@ function openNodeEditor(draft, index, repaint, onCancel = null) {
       + nodeChoiceField("Docker 网络", "network", [["install", "仅安装依赖时联网"], ["off", "完全断网"], ["on", "全程联网"]], s.network || "install")
       + nodeField("Docker 镜像", `<input name="image" value="${esc(s.image || "")}" maxlength="80" placeholder="留空按仓库自动选择">`);
   } else {
-    specific = nodeChoiceField("节点作用", "purpose", [["findings", "产出审查发现（参与裁决）"], ["context", "提供分析上下文（不参与裁决）"]], s.purpose || "findings",
-      "上下文节点的完整输出会传给之后所有模型节点；发现节点必须返回 findings JSON。")
-      + (s.kind === "api"
+    specific = (s.kind === "api"
         ? nodeChoiceField("模型凭证", "credential_id", nodeCredentials.filter((c) => !c.disabled).map((c) => [c.id, `${c.label} · ${c.provider}`]), s.credential_id,
           '在“凭证与模型”里可添加 OpenAI、Anthropic、Gemini、DeepSeek 等连接。')
         : nodeChoiceField("Agent 执行器", "provider", [["claude", "Claude Code"], ["codex", "Kimi / Codex"]], s.provider || "claude"))
       + nodeField("模型 ID", `<input name="model" value="${esc(s.model || "")}" maxlength="80" ${s.kind === "api" ? "required" : ""} placeholder="${s.kind === "api" ? "填写服务商模型 ID" : "留空使用默认模型"}">`)
-      + nodeField("本节点任务与侧重点", `<textarea name="prompt" rows="7" maxlength="8000" placeholder="说明本节点要重点检查什么；基础审查规则与前序上下文会自动附加">${esc(s.prompt || "")}</textarea>`);
+      + nodeField(s.purpose === "findings" ? "独立评审任务" : "上下文整理任务", `<textarea name="prompt" rows="7" maxlength="8000" placeholder="${s.purpose === "findings" ? "说明独立评审要检查的重点；不会看到其他评审器结果" : "说明要从仓库与 diff 中提取什么信息，供评审组读取"}">${esc(s.prompt || "")}</textarea>`);
   }
   dialog.innerHTML = `<form method="dialog" class="rh-dialog-inner"><div class="node-dialog-head"><div><span class="node-kind ${s.kind}">${NODE_KIND[s.kind]}</span>
       <h2>配置节点 ${index + 1}</h2></div><button type="button" class="ghost" data-close aria-label="关闭">×</button></div>
@@ -2537,7 +2555,7 @@ function openNodeEditor(draft, index, repaint, onCancel = null) {
       s.gate = data.get("gate"); s.sandbox = data.get("sandbox");
       s.network = data.get("network"); s.image = String(data.get("image") || "").trim();
     } else {
-      s.purpose = data.get("purpose"); s.model = String(data.get("model") || "").trim();
+      s.model = String(data.get("model") || "").trim();
       s.prompt = String(data.get("prompt") || "").trim();
       if (s.kind === "api") s.credential_id = +data.get("credential_id");
       else s.provider = data.get("provider");
@@ -2551,22 +2569,37 @@ function openNodeEditor(draft, index, repaint, onCancel = null) {
 async function addPipeNode(draft, repaint) {
   const kind = await uiChoice("添加流水线节点", [
     { value: "gate", label: "门禁 · 执行测试、构建或安全扫描" },
-    { value: "reviewer", label: "Agent · 可读取仓库并调用工具" },
-    { value: "api", label: "模型 API · 通过凭证调用服务商" },
-  ], "节点按顺序执行；之后的模型节点都能读取前序节点的结果。");
+    { value: "reviewer", label: "Agent 上下文 · 读取仓库并提取信息" },
+    { value: "api", label: "模型 API 上下文 · 通过凭证提取信息" },
+  ], "上游上下文会提供给交叉评审组；门禁只负责拦截。");
   if (!kind) return;
-  const node = newPipeNode(kind, draft.length + 1);
-  draft.push(node);
+  const node = newPipeNode(kind, draft.length);
+  draft.splice(draft.length - 1, 0, node);
   repaint();
-  openNodeEditor(draft, draft.length - 1, repaint, () => {
+  openNodeEditor(draft, draft.length - 2, repaint, () => {
     const i = draft.findIndex((s) => s.id === node.id);
     if (i >= 0) draft.splice(i, 1);
     repaint();
   });
 }
+async function addReviewMember(group, repaint) {
+  const kind = await uiChoice("添加独立评审器", [
+    { value: "reviewer", label: "Agent · 能读取仓库源码" },
+    { value: "api", label: "模型 API · 根据内联 diff 评审" },
+  ], "所有评审器读取同一份上游上下文，不会看到彼此的判断。");
+  if (!kind) return;
+  const member = { ...newPipeNode(kind, group.reviewers.length + 1), purpose: "findings" };
+  group.reviewers.push(member);
+  repaint();
+  openNodeEditor(group.reviewers, group.reviewers.length - 1, repaint, () => {
+    const i = group.reviewers.findIndex((m) => m.id === member.id);
+    if (i >= 0) group.reviewers.splice(i, 1);
+    repaint();
+  });
+}
 function bindPipeList(root, draft, repaint) {
   const move = (from, to) => {
-    if (to < 0 || to >= draft.length || from === to) return;
+    if (to < 0 || to >= draft.length - 1 || from === to) return;
     const [node] = draft.splice(from, 1);
     draft.splice(to, 0, node);
     repaint();
@@ -2579,6 +2612,22 @@ function bindPipeList(root, draft, repaint) {
     draft[+c.dataset.en].enabled = c.checked;
     c.closest(".pipe-step").classList.toggle("off", !c.checked);
   });
+  const group = draft.find((s) => s.kind === "review");
+  if (group) {
+    root.querySelector("[data-member-add]").onclick = () => addReviewMember(group, repaint);
+    const members = group.reviewers;
+    const moveMember = (from, to) => {
+      if (to < 0 || to >= members.length) return;
+      const [m] = members.splice(from, 1); members.splice(to, 0, m); repaint();
+    };
+    root.querySelectorAll("[data-member-left]").forEach((b) => b.onclick = () => moveMember(+b.dataset.memberLeft, +b.dataset.memberLeft - 1));
+    root.querySelectorAll("[data-member-right]").forEach((b) => b.onclick = () => moveMember(+b.dataset.memberRight, +b.dataset.memberRight + 1));
+    root.querySelectorAll("[data-member-edit]").forEach((b) => b.onclick = () => openNodeEditor(members, +b.dataset.memberEdit, repaint));
+    root.querySelectorAll("[data-member-del]").forEach((b) => b.onclick = () => { members.splice(+b.dataset.memberDel, 1); repaint(); });
+    root.querySelectorAll("[data-member-en]").forEach((c) => c.onchange = () => {
+      members[+c.dataset.memberEn].enabled = c.checked; c.closest(".review-member").classList.toggle("off", !c.checked);
+    });
+  }
   let dragIndex = null;
   root.querySelectorAll("[data-drag]").forEach((h) => {
     h.ondragstart = (e) => { dragIndex = +h.dataset.drag; e.dataTransfer.setData("text/plain", String(dragIndex)); };

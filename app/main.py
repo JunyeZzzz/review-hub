@@ -247,8 +247,9 @@ def delete_model_credential(cid: int):
     for raw in [db.get_setting("pipeline"), *[p["pipeline_json"] for p in
                                                 db.query("SELECT pipeline_json FROM projects")]]:
         try:
-            if any(s.get("kind") == "api" and s.get("credential_id") == cid
-                   for s in json.loads(raw or "[]")):
+            if any(node.get("kind") == "api" and node.get("credential_id") == cid
+                   for step in json.loads(raw or "[]")
+                   for node in [step, *step.get("reviewers", [])]):
                 raise HTTPException(409, "凭证仍被流水线节点引用，请先解绑")
         except (ValueError, TypeError):
             pass
@@ -259,9 +260,40 @@ def delete_model_credential(cid: int):
     return {"ok": True}
 
 
+def _clean_model_node(s: dict, purpose: str, fallback: str) -> dict:
+    kind = s.get("kind") or "reviewer"
+    common = {
+        "id": str(s.get("id") or fallback)[:40],
+        "kind": kind,
+        "name": str(s.get("name") or "模型节点")[:40],
+        "enabled": bool(s.get("enabled", True)),
+        "model": str(s.get("model") or "")[:80],
+        "prompt": str(s.get("prompt") or "")[:8000],
+        "purpose": purpose,
+    }
+    if kind == "reviewer":
+        provider = str(s.get("provider") or "claude")
+        if provider not in ("claude", "codex"):
+            raise HTTPException(400, "未知 Agent 执行器")
+        return {**common, "provider": provider}
+    if kind == "api":
+        try:
+            cid = int(s.get("credential_id"))
+            api_nodes.get_active(cid)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"API 节点凭证无效：{exc}") from exc
+        if not common["model"].strip():
+            raise HTTPException(400, "API 节点必须填写模型 ID")
+        return {**common, "credential_id": cid, "model": common["model"].strip()}
+    raise HTTPException(400, "未知模型节点类型")
+
+
 def _clean_pipeline(steps) -> list:
-    """全局默认与项目级编排共用的校验/清洗。"""
-    if not isinstance(steps, list) or not 1 <= len(steps) <= 20:
+    """全局与项目共用：旧平铺配置读入后规范化，评审组必须是终点。"""
+    if not isinstance(steps, list):
+        raise HTTPException(400, "steps 必须是节点列表")
+    steps = worker.normalize_pipeline(steps)
+    if not 1 <= len(steps) <= 20:
         raise HTTPException(400, "steps 必须包含 1 至 20 个节点")
     clean = []
     for s in steps:
@@ -282,44 +314,35 @@ def _clean_pipeline(steps) -> list:
                 "network": s.get("network") if s.get("network") in ("off", "install", "on") else "install",
                 "image": str(s.get("image") or "")[:80],
             })
-        elif kind == "reviewer":
-            provider = str(s.get("provider") or "claude")
-            if provider not in ("claude", "codex"):
-                raise HTTPException(400, "未知 Agent 执行器")
-            clean.append({
-                "id": str(s.get("id") or f"step{len(clean)}")[:40],
-                "kind": "reviewer",
-                "name": str(s.get("name") or "评审步骤")[:40],
-                "provider": provider,
-                "enabled": bool(s.get("enabled", True)),
-                "model": str(s.get("model") or "")[:80],
-                "prompt": str(s.get("prompt") or "")[:8000],
-                "purpose": "context" if s.get("purpose") == "context" else "findings",
-            })
-        elif kind == "api":
-            cid = s.get("credential_id")
-            try:
-                api_nodes.get_active(int(cid))
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(400, f"API 节点凭证无效：{exc}") from exc
-            if not str(s.get("model") or "").strip():
-                raise HTTPException(400, "API 节点必须填写模型 ID")
-            clean.append({
-                "id": str(s.get("id") or f"api{len(clean)}")[:40],
-                "kind": "api", "name": str(s.get("name") or "模型 API")[:40],
-                "credential_id": int(cid), "model": str(s["model"]).strip()[:80],
-                "prompt": str(s.get("prompt") or "")[:8000],
-                "purpose": "context" if s.get("purpose") == "context" else "findings",
-                "enabled": bool(s.get("enabled", True)),
-            })
+        elif kind in ("reviewer", "api"):
+            if s.get("purpose") != "context":
+                raise HTTPException(400, "独立模型节点只能提供上下文；评审器请加入交叉评审组")
+            clean.append(_clean_model_node(s, "context", f"context{len(clean)}"))
+        elif kind == "review":
+            members = s.get("reviewers")
+            if not isinstance(members, list) or not 1 <= len(members) <= 20:
+                raise HTTPException(400, "交叉评审组需要 1 至 20 个评审器")
+            if any(not isinstance(m, dict) for m in members):
+                raise HTTPException(400, "评审器必须是对象")
+            clean.append({"id": str(s.get("id") or "cross-review")[:40], "kind": "review",
+                          "name": str(s.get("name") or "交叉评审")[:40],
+                          "enabled": bool(s.get("enabled", True)),
+                          "reviewers": [_clean_model_node(m, "findings", f"reviewer{i}")
+                                        for i, m in enumerate(members)]})
         else:
             raise HTTPException(400, "未知节点类型")
-    if len({s["id"] for s in clean}) != len(clean):
+    all_nodes = [node for step in clean for node in [step, *step.get("reviewers", [])]]
+    if len(all_nodes) > 20:
+        raise HTTPException(400, "整条流水线最多 20 个节点（含评审器）")
+    if len({s["id"] for s in all_nodes}) != len(all_nodes):
         raise HTTPException(400, "节点 ID 不能重复")
-    if len({s["name"] for s in clean}) != len(clean):
+    if len({s["name"] for s in all_nodes}) != len(all_nodes):
         raise HTTPException(400, "节点名称不能重复，报告和交叉裁决需要区分来源")
-    if not any(s["kind"] in ("reviewer", "api") and s["purpose"] == "findings" and s["enabled"] for s in clean):
-        raise HTTPException(400, "至少启用一个产出审查发现的 Agent 或 API 节点")
+    groups = [s for s in clean if s["kind"] == "review"]
+    if len(groups) != 1 or clean[-1] is not groups[0] or not groups[0]["enabled"]:
+        raise HTTPException(400, "需要一个启用的交叉评审组，且必须放在最后")
+    if not any(m["enabled"] for m in groups[0]["reviewers"]):
+        raise HTTPException(400, "交叉评审组至少启用一个评审器")
     return clean
 
 

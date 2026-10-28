@@ -48,10 +48,13 @@ DEFAULT_GATE = {"id": "gate-test", "kind": "gate", "name": "测试门禁", "gate
 
 DEFAULT_PIPELINE = [
     dict(DEFAULT_GATE),
-    {"id": "claude", "kind": "reviewer", "name": "Claude 评审", "provider": "claude",
-     "enabled": True, "model": "", "prompt": ""},
-    {"id": "kimi", "kind": "reviewer", "name": "Kimi 评审", "provider": "codex",
-     "enabled": True, "model": "", "prompt": ""},
+    {"id": "cross-review", "kind": "review", "name": "交叉评审", "enabled": True,
+     "reviewers": [
+         {"id": "claude", "kind": "reviewer", "name": "Claude 评审", "provider": "claude",
+          "enabled": True, "model": "", "prompt": ""},
+         {"id": "kimi", "kind": "reviewer", "name": "Kimi 评审", "provider": "codex",
+          "enabled": True, "model": "", "prompt": ""},
+     ]},
 ]
 
 
@@ -67,6 +70,21 @@ def _load_steps(raw) -> list | None:
     return None
 
 
+def normalize_pipeline(steps: list) -> list:
+    """旧版平铺发现节点收拢为最终交叉评审组；上下文节点保留原顺序。"""
+    if not isinstance(steps, list) or any(s.get("kind") == "review" for s in steps if isinstance(s, dict)):
+        return steps
+    reviewers = [s for s in steps if isinstance(s, dict)
+                 and s.get("kind", "reviewer") in ("reviewer", "api")
+                 and s.get("purpose", "findings") != "context"]
+    if not reviewers:
+        return steps
+    rest = [s for s in steps if s not in reviewers]
+    group_id = "cross-review" if not any(s.get("id") == "cross-review" for s in steps if isinstance(s, dict)) else "review-group"
+    return [*rest, {"id": group_id, "kind": "review", "name": "交叉评审",
+                    "enabled": True, "reviewers": reviewers}]
+
+
 def get_pipeline(project: dict | None = None) -> list:
     """生效编排：项目覆盖 > 全局默认；返回用户看到的真实节点顺序。"""
     raw = None
@@ -78,7 +96,7 @@ def get_pipeline(project: dict | None = None) -> list:
     steps = _load_steps(raw) or _load_steps(db.get_setting("pipeline"))
     if steps is None:
         steps = json.loads(json.dumps(DEFAULT_PIPELINE))
-    return steps
+    return normalize_pipeline(steps)
 
 
 MAX_NODE_PROMPT_CHARS = 500_000
@@ -87,7 +105,7 @@ MAX_NODE_OUTPUT_CHARS = 200_000
 
 def _node_prompt(step: dict, built: dict, prior: list[dict], workdir: Path,
                  *, api: bool = False) -> str:
-    """每个模型节点拿到全部前序节点的最终输出；超出上限显式失败。"""
+    """模型节点只接收上游 LLM 上下文；交叉评审成员之间不交换输出。"""
     purpose = step.get("purpose", "findings")
     if purpose == "context":
         base = (f"你在代码审查流水线中负责：{step.get('name', '分析')}。"
@@ -108,7 +126,7 @@ def _node_prompt(step: dict, built: dict, prior: list[dict], workdir: Path,
                  + "\n## 评审规则\n"
                  + (config.POLICY_DIR / "REVIEW.md").read_text(encoding="utf-8"))
     if prior:
-        base += "\n## 所有前序节点的最终上下文（按执行顺序）\n"
+        base += "\n## 上游 LLM 节点的最终上下文（按执行顺序）\n"
         for i, item in enumerate(prior, 1):
             base += f"\n### {i}. {item['name']} [{item['status']}]\n{item['output']}\n"
     if len(base) > MAX_NODE_PROMPT_CHARS:
@@ -139,6 +157,28 @@ def _run_reviewer_step(step: dict, project: dict, workdir: Path,
     if len(text) > MAX_NODE_OUTPUT_CHARS:
         raise RuntimeError(f"节点输出超过 {MAX_NODE_OUTPUT_CHARS} 字符上限")
     return text, trace, prompt_text
+
+
+def _run_review_group(group: dict, project: dict, workdir: Path, built: dict,
+                      diff_text: str, prior: list[dict], sl: "StepLog") -> list[tuple[str, str]]:
+    """组内各成员使用同一份上游上下文；其输出只汇入组后的裁决。"""
+    outs = []
+    for member in group.get("reviewers", []):
+        if not member.get("enabled", True):
+            continue
+        name = member.get("name") or member.get("id", "评审")
+        t0 = sl.start(name)
+        try:
+            text, trace, prompt_text = _run_reviewer_step(
+                member, project, workdir, built, diff_text, prior)
+            if verdict.extract_findings(text) is None:
+                raise RuntimeError("评审器未返回有效 findings JSON，不能判定通过")
+            sl.finish(t0, "ok", log=text, trace=trace, prompt=prompt_text)
+            outs.append((name, text))
+        except Exception as e:
+            sl.finish(t0, "fail", str(e))
+            raise
+    return outs
 
 
 def _git_retry(workdir: Path | None, *args: str, attempts: int = 4,
@@ -349,45 +389,41 @@ def _process_run(run, project) -> None:
                               for f in scan["findings"]])
             return
 
-        # 流水线逐节点执行；每个模型节点接收全部前序节点的最终结果。
+        # 门禁只拦截；上下文节点传递输出；交叉评审组成员共享上游输入、互不读取结果。
         pipeline = [s for s in get_pipeline(project) if s.get("enabled", True)]
         # 编排回显：本次到底按哪层配置执行的（coder 验证"自编排真的生效"的依据）
         db.execute("UPDATE runs SET pipeline_snapshot=? WHERE id=?",
                    (json.dumps({
                        "source": "project" if (project["pipeline_json"] or "").strip() else "global",
                        "steps": pipeline}, ensure_ascii=False), run_id))
-        reviewer_steps = [s for s in pipeline if s.get("kind", "reviewer") in ("reviewer", "api")
-                          and s.get("purpose", "findings") == "findings"]
-        if not reviewer_steps:
-            raise RuntimeError("流水线没有启用的发现节点，不能判定通过")
+        review_groups = [s for s in pipeline if s.get("kind") == "review"]
+        if len(review_groups) != 1 or not any(m.get("enabled", True) for m in review_groups[0].get("reviewers", [])):
+            raise RuntimeError("流水线需要一个启用且包含评审器的交叉评审组")
 
         reviewers_out = []   # (步骤名, 输出文本)
-        prior = []           # 本次执行的全部前序节点最终上下文
+        prior = []           # 只包含上游 LLM 上下文节点的最终输出
         built = None
         for step in pipeline:
             if step.get("kind") == "gate":
-                blocked, gate_status, gate_output = _run_gate(step, project, run, workdir, diff_files, sl)
-                prior.append({"name": step.get("name") or "门禁", "status": gate_status,
-                              "output": gate_output})
+                blocked, _, _ = _run_gate(step, project, run, workdir, diff_files, sl)
                 if blocked:
                     return   # 门禁红灯已收尾（fail loud），后续步骤不再执行
                 continue
             if built is None:
                 built = prompts.build(workdir, intent=intent, profile=project["profile"] or "")
             diff_text = built["diff_file"].read_text(encoding="utf-8")
+            if step.get("kind") == "review":
+                reviewers_out.extend(_run_review_group(step, project, workdir, built, diff_text, prior, sl))
+                continue
             name = step.get("name") or step.get("id", "评审")
             t0 = sl.start(name)
             try:
                 text, trace, prompt_text = _run_reviewer_step(step, project, workdir, built, diff_text, prior)
-                if step.get("purpose", "findings") == "findings" and verdict.extract_findings(text) is None:
-                    raise RuntimeError("节点未返回有效 findings JSON，不能判定通过")
                 sl.finish(t0, "ok", log=text, trace=trace, prompt=prompt_text)
                 prior.append({"name": name, "status": "ok", "output": text})
-                if step.get("purpose", "findings") == "findings":
-                    reviewers_out.append((name, text))
             except Exception as e:
                 sl.finish(t0, "fail", str(e))
-                raise   # fail loud：评审步骤失败 -> 整个 run 红灯
+                raise
 
         # 裁决：多评审者交叉合并
         t0 = sl.start("交叉裁决")
@@ -421,7 +457,7 @@ def _process_run(run, project) -> None:
 
 def _run_gate(step: dict, project: dict, run: dict, workdir: Path,
               diff_files: list, sl: StepLog) -> tuple[bool, str, str]:
-    """返回 (是否阻断, 状态, 完整门禁输出)，供下一节点读取。"""
+    """返回 (是否阻断, 状态, 日志)；日志只供报告复盘，不传给模型。"""
     name = step.get("name") or f"门禁:{step.get('gate', 'tests')}"
     gtype = step.get("gate") or "tests"
     t0 = sl.start(name)
