@@ -163,7 +163,7 @@ document.addEventListener("click", async (e) => {
     toast(next === "false_positive" ? "已标记误报（计入误报率）"
       : next === "confirmed" ? "已标记确认" : "已撤销标记");
     if (location.hash === `#/runs/${runId}`) renderRun(runId, true);
-    else if (location.hash === "#/workbench") refreshMarks();
+    else if (location.hash === "#/workbench") refreshWorkbenchData();
   } catch (err) { toast(err.message, true); }
 });
 
@@ -189,6 +189,7 @@ document.addEventListener("click", async (e) => {
       body: { run_id: +b.dataset.evalRun, idx: +b.dataset.evalIdx } });
     toast(r.existed ? "这条已经在工作台的评测集里"
       : `已存为评测用例（${r.polarity === "positive" ? "正例：应报出" : "负例：不应再报出"}）`);
+    if (location.hash === "#/workbench") refreshWorkbenchData();
   } catch (err) { toast(err.message, true); }
 });
 
@@ -486,23 +487,7 @@ let marksFilter = { disposition: "", project_id: 0 };
 const marksSel = new Set();   // "runId:idx" -> 选中，供批量处置
 let workbenchSearch = "";
 let marksData = null;
-let workbenchRuns = [];
 let workbenchPrOnly = false;
-
-function paintWorkbenchRuns() {
-  const box = $("wb-runs");
-  if (!box) return;
-  const rows = workbenchRuns.filter((r) =>
-    (!workbenchPrOnly || r.pr_number) &&
-    (!marksFilter.project_id || r.project_id === marksFilter.project_id) &&
-    (!workbenchSearch || `${r.project} ${r.head_sha || ""} ${r.pr_number || ""} ${r.id}`.toLowerCase().includes(workbenchSearch)));
-  box.innerHTML = rows.length ? `<table><thead><tr><th>结果</th><th>项目 / 对象</th><th>时间</th><th>下一步</th></tr></thead><tbody>
-    ${rows.map((r) => `<tr><td>${statusHtml(r.status)}</td>
-      <td><a href="#/runs/${r.id}">${esc(r.project)} · ${r.pr_number ? `PR #${r.pr_number}` : esc((r.head_sha || r.ref || "").slice(0, 10))}</a></td>
-      <td class="mono small muted">${fmtAgo(r.created_at)}</td>
-      <td><a href="#/runs/${r.id}">${r.status === "failed" ? "查看失败原因" : r.status === "blocked" ? "查看发现并处置" : "查看报告"} →</a></td></tr>`).join("")}</tbody></table>`
-    : `<div class="empty">当前筛选下没有审查记录</div>`;
-}
 
 function marksStatsHtml(s) {
   const fpPct = s.total ? Math.round((s.false_positive / s.total) * 100) + "%" : "—";
@@ -595,7 +580,7 @@ async function batchMark(val) {
     }
     marksSel.clear();
     toast(`已批量${val === "confirmed" ? "确认" : "标误报"} ${entries.length} 条`);
-    refreshMarks();
+    if (location.hash === "#/workbench") refreshWorkbenchData(); else refreshMarks();
   } catch (e) { toast(e.message, true); }
 }
 
@@ -633,75 +618,264 @@ async function refreshMarks() {
   paintMarks(data);
 }
 
+/* 工作台：队列决定阅读顺序；同屏显示发现、证据和处置。 */
+const wbState = { projects: [], runs: [], marks: null, metrics: null, eval: null,
+  run: null, finding: 0, diff: new Map() };
+
+function wbMatches(item) {
+  if (marksFilter.project_id && item.project_id !== marksFilter.project_id) return false;
+  return !workbenchSearch || `${item.project || ""} ${item.title || ""} ${item.file || ""}
+    ${item.pr_number || ""} ${item.head_sha || ""} ${item.run_id || item.id || ""}`
+    .toLowerCase().includes(workbenchSearch);
+}
+
+function wbPending() { return (wbState.marks?.pending || []).filter(wbMatches); }
+function wbRuns() {
+  return wbState.runs.filter((r) => wbMatches(r) && (!workbenchPrOnly || r.pr_number));
+}
+function wbQueueHtml() {
+  const pending = wbPending(), runs = wbRuns();
+  return `<div class="wb-queue-head"><b>待处理发现 <span class="wb-count">${pending.length}</span></b>
+      <span class="small muted">先处理 Important</span></div>
+    <div class="wb-pending-list">${pending.length ? pending.map((f) => `
+      <button class="wb-queue-item ${wbState.run?.id === f.run_id && wbState.finding === f.idx ? "active" : ""}"
+        data-wb-run="${f.run_id}" data-wb-idx="${f.idx}">
+        <span class="wb-item-top"><span class="badge imp">Important</span><span class="muted small">${fmtAgo(f.created_at)}</span></span>
+        <strong>${esc(f.title)}</strong>
+        <span class="mono muted">${esc(f.project)} · ${esc(f.file || "门禁")}${f.line ? ":" + esc(f.line) : ""}</span>
+      </button>`).join("") : '<div class="wb-queue-empty">当前没有待处理 Important</div>'}</div>
+    <div class="wb-queue-head wb-recent-head"><b>近期审查</b><a href="#/runs" class="small">全部审查 →</a></div>
+    <label class="wb-toggle"><input id="wb-pr-only" type="checkbox" ${workbenchPrOnly ? "checked" : ""}> 只看 PR</label>
+    <div class="wb-run-list">${runs.length ? runs.map((r) => `
+      <button class="wb-run-item ${wbState.run?.id === r.id ? "active" : ""}" data-wb-run="${r.id}">
+        <span class="wb-run-main">${statusHtml(r.status)}<strong>${esc(r.project)} · ${r.pr_number ? "PR #" + r.pr_number : esc((r.head_sha || r.ref || "").slice(0, 8))}</strong></span>
+        <span class="wb-run-meta">${r.important_count ? '<span class="badge imp">' + r.important_count + ' Important</span>' : ""}
+          <span>${fmtAgo(r.created_at)}</span></span>
+      </button>`).join("") : '<div class="wb-queue-empty">当前筛选下没有审查</div>'}</div>`;
+}
+
+function wbFindingListHtml(run) {
+  const items = run.findings || [];
+  if (!items.length) return `<div class="wb-empty-review"><b>${run.status === "passed" ? "没有阻断发现" : "尚无发现"}</b>
+    <span>${run.status === "running" ? "审查完成后这里会更新" : "可打开完整报告检查执行过程"}</span></div>`;
+  return items.map((f, i) => `<button class="wb-finding-item ${wbState.finding === i ? "active" : ""}"
+      data-wb-finding="${i}">
+      <span class="wb-item-top"><span class="badge ${f.severity === "IMPORTANT" ? "imp" : ""}">${esc(f.severity || "发现")}</span>
+        ${f.disposition ? '<span class="badge ' + (f.disposition === "confirmed" ? "confirmed" : "fp") + '">' + (f.disposition === "confirmed" ? "已确认" : "误报") + '</span>' : ""}</span>
+      <strong>${esc(f.title)}</strong>
+      <span class="mono muted">${esc(f.file || "门禁")}${f.line ? ":" + esc(f.line) : ""}</span>
+    </button>`).join("");
+}
+
+function wbEvidenceHtml(run, f, idx) {
+  if (!f) return `<div class="wb-empty-review">选择左侧发现，查看触发条件、代码和建议</div>`;
+  const important = f.severity === "IMPORTANT";
+  return `<div class="wb-evidence-head">
+      <div><span class="badge ${important ? "imp" : ""}">${esc(f.severity || "发现")}</span>
+        <span class="small muted">${esc((f.sources || []).join(" + "))}</span></div>
+      <button class="ghost small-btn" data-copy-run="${run.id}" data-copy-idx="${idx}">复制问题</button>
+    </div>
+    <h2>${esc(f.title)}</h2>
+    <div class="wb-file-line">${fileLink(run, f.file, f.line)}</div>
+    <section class="wb-evidence-section"><div class="ctx-label">触发条件 / 影响</div><p>${esc(f.condition || "未提供触发条件")}</p></section>
+    <div class="wb-evidence-actions">
+      ${important ? `<button class="${f.disposition === "confirmed" ? "primary" : "ghost"} small-btn"
+        data-mark="confirmed" data-run="${run.id}" data-idx="${idx}" data-cur="${esc(f.disposition || "")}">${f.disposition === "confirmed" ? "已确认 ✓" : "确认问题"}</button>
+      <button class="${f.disposition === "false_positive" ? "primary" : "ghost"} small-btn"
+        data-mark="false_positive" data-run="${run.id}" data-idx="${idx}" data-cur="${esc(f.disposition || "")}">${f.disposition === "false_positive" ? "已标误报 ✓" : "标记误报"}</button>
+      ${f.disposition ? `<button class="ghost small-btn" data-eval-run="${run.id}" data-eval-idx="${idx}">存为评测用例</button>` : ""}` : ""}
+      <a href="#/runs/${run.id}" class="wb-report-link">完整报告 →</a>
+    </div>
+    <section class="wb-evidence-section"><div class="ctx-label">建议修复</div><p>${esc(f.fix || "未提供建议")}</p></section>
+    <section class="wb-evidence-section"><div class="ctx-label">对应代码</div>
+      <div id="wb-code" class="wb-code">${run.has_diff && f.file ? "正在定位 diff…" : "本次审查没有保存可定位的 diff"}</div></section>`;
+}
+
+function wbDiffExcerpt(diff, file, line) {
+  const src = String(diff || "").split("\n"), rows = [];
+  let active = false, current = 0;
+  for (const raw of src) {
+    if (raw.startsWith("diff --git ")) { active = raw.endsWith(" b/" + file); continue; }
+    if (!active) continue;
+    if (raw.startsWith("@@")) {
+      const m = raw.match(/\+(\d+)/);
+      current = m ? +m[1] : 0;
+      continue;
+    }
+    if (!current || raw.startsWith("---") || raw.startsWith("+++")) continue;
+    const number = current;
+    if (!raw.startsWith("-")) current++;
+    if (Math.abs(number - line) <= 4 && !raw.startsWith("\\")) rows.push({ number, raw });
+  }
+  return rows.length ? `<div class="wb-code-lines">${rows.map(({number, raw}) => `
+    <div class="wb-code-row ${raw.startsWith("+") ? "add" : raw.startsWith("-") ? "del" : ""} ${number === +line ? "focus" : ""}">
+      <span>${raw.startsWith("-") ? "" : number}</span><code>${esc(raw)}</code></div>`).join("")}</div>`
+    : '<span class="muted">未在保存的 diff 中找到该行；可从文件链接查看完整代码。</span>';
+}
+
+async function wbLoadDiff() {
+  const run = wbState.run, f = run?.findings?.[wbState.finding], box = $("wb-code");
+  if (!run || !f?.file || !run.has_diff || !box) return;
+  const selected = wbState.finding;
+  try {
+    if (!wbState.diff.has(run.id)) wbState.diff.set(run.id, (await api(`/api/runs/${run.id}/diff`)).diff || "");
+    if (wbState.run?.id === run.id && wbState.finding === selected && $("wb-code")) {
+      $("wb-code").innerHTML = wbDiffExcerpt(wbState.diff.get(run.id), f.file, +f.line);
+    }
+  } catch (e) { if ($("wb-code")) $("wb-code").textContent = "代码加载失败：" + e.message; }
+}
+
+function wbReviewHtml() {
+  const run = wbState.run;
+  if (!run) return '<div class="wb-empty-review">暂无审查记录。接入项目后，审查会显示在这里。</div>';
+  const f = (run.findings || [])[wbState.finding];
+  return `<div class="wb-review-head">
+      <div><span class="wb-eyebrow">当前审查 · RUN #${run.id}</span>
+        <h2>${esc(run.project)} ${run.pr_number ? "· PR #" + run.pr_number : "· " + esc((run.head_sha || "").slice(0, 8))}</h2>
+        <div class="small muted">${esc(run.repo || run.branch || "")} · ${fmtTime(run.created_at)}
+          ${run.files_changed != null ? " · " + run.files_changed + " 文件" : ""}</div></div>
+      <div class="wb-review-status">${statusHtml(run.status)}<a href="#/runs/${run.id}">完整报告 ↗</a></div>
+    </div>
+    <div class="wb-review-split">
+      <div class="wb-findings"><div class="wb-pane-label">审查发现 <span>${(run.findings || []).length}</span></div>
+        <div class="wb-findings-list">${wbFindingListHtml(run)}</div></div>
+      <div class="wb-evidence" id="wb-evidence">${wbEvidenceHtml(run, f, wbState.finding)}</div>
+    </div>`;
+}
+
+function wbAnalysisHtml() {
+  const marks = (wbState.marks?.marks || []).filter(wbMatches);
+  const s = { total: marks.length,
+    confirmed: marks.filter((m) => m.disposition === "confirmed").length,
+    false_positive: marks.filter((m) => m.disposition === "false_positive").length };
+  const hist = wbState.eval?.history || [], cases = wbState.eval?.cases || [];
+  const latest = hist[0], weeks = wbState.metrics?.weeks || [];
+  const maxRuns = Math.max(1, ...weeks.map((w) => +w.runs || 0));
+  return `<section class="wb-analysis">
+    <div class="wb-analysis-title"><div><span class="wb-eyebrow">质量闭环</span><h2>处置 · 评测 · 趋势</h2></div>
+      <span class="small muted">处置按筛选展示；评测与趋势为全局</span></div>
+    <div class="wb-analysis-grid">
+      <div class="panel wb-analysis-card"><div class="wb-card-head"><h3>处置记录</h3><span class="small muted">已处置 ${s.total || 0}</span></div>
+        <div class="wb-mini-stats"><span>确认 <b>${s.confirmed || 0}</b></span><span>误报 <b>${s.false_positive || 0}</b></span></div>
+        <div class="wb-ledger">${marks.length ? marks.slice(0, 5).map((m) => `
+          <div class="wb-ledger-row"><span class="badge ${m.disposition === "confirmed" ? "confirmed" : "fp"}">${m.disposition === "confirmed" ? "确认" : "误报"}</span>
+            <a href="#/runs/${m.run_id}" title="${esc(m.title)}">${esc(m.title)}</a>
+            ${m.disposition === "false_positive" ? `<button class="ghost small-btn" data-fb-run="${m.run_id}" data-fb-idx="${m.idx}" data-fb-title="${esc(m.title)}" data-fb-file="${esc(m.file || "")}">回流</button>` : ""}</div>`).join("")
+          : '<div class="wb-queue-empty">还没有处置记录</div>'}</div>
+        <details class="wb-expand"><summary>查看完整处置台账</summary><div class="wb-overflow">${ledgerMarksTable(marks)}</div></details></div>
+      <div class="panel wb-analysis-card"><div class="wb-card-head"><h3>回归评测</h3>
+          <button class="primary small-btn" id="eval-run" ${!cases.length || latest?.status === "running" ? "disabled" : ""}>${latest?.status === "running" ? "跑分中…" : "运行评测"}</button></div>
+        <div id="eval-count" class="small muted">${cases.length} 个用例 · 正例 ${cases.filter((c) => c.polarity === "positive").length} · 负例 ${cases.filter((c) => c.polarity !== "positive").length}</div>
+        <div class="wb-eval-score">${latest ? `<strong>${latest.status === "running" ? "进行中" : latest.status === "failed" ? "失败" : (latest.hit ?? "—") + " / " + (latest.cases_total ?? "—")}</strong>
+          <span>${latest.status === "done" ? "命中用例" : "最近一轮"} · 漏报 ${latest.miss ?? "—"} · 误报重现 ${latest.fp ?? "—"}</span>`
+          : '<strong>尚无基线</strong><span>处置发现后存为用例，再运行评测</span>'}</div>
+        <details class="wb-expand"><summary>用例与逐条结果</summary>
+          <div id="eval-cases" class="wb-overflow">${evalCasesHtml(cases)}</div>
+          ${latest ? '<div class="wb-overflow">' + evalRunHtml(latest, hist[1], {id:"eval-latest"}) + '</div>' : ""}
+          ${hist.slice(1).map((h, i) => '<div class="wb-overflow">' + evalRunHtml(h, hist[i + 2]) + '</div>').join("")}
+        </details></div>
+      <div class="panel wb-analysis-card"><div class="wb-card-head"><h3>近 8 周趋势</h3><a href="#/runs" class="small">审查记录 →</a></div>
+        <div class="wb-trend">${weeks.length ? weeks.slice(-8).map((w) => `
+          <div class="wb-trend-row"><span class="mono">${esc(w.start || w.week)}</span>
+            <span class="wb-trend-track"><i style="width:${Math.round((+w.runs || 0) / maxRuns * 100)}%"></i></span>
+            <b>${w.runs}</b></div>`).join("") : '<div class="wb-queue-empty">还没有审查数据</div>'}</div>
+        <div class="wb-trend-foot">${weeks.length ? `最近一周：问题 ${weeks.at(-1).blocked} / 审查 ${weeks.at(-1).runs}
+          · 误报 ${weeks.at(-1).fp} / 已处置 ${weeks.at(-1).marked}` : "等待首轮审查"}</div>
+      </div>
+    </div></section>`;
+}
+
+function paintWorkbenchV2() {
+  if (!$("wb-queue")) return;
+  if ($("wb-pending-total")) $("wb-pending-total").textContent = wbPending().length;
+  if ($("wb-failed-total")) $("wb-failed-total").textContent = wbRuns().filter((r) => r.status === "failed").length;
+  if ($("wb-running-total")) $("wb-running-total").textContent = wbRuns().filter((r) => ["running", "queued"].includes(r.status)).length;
+  $("wb-queue").innerHTML = wbQueueHtml();
+  $("wb-review").innerHTML = wbReviewHtml();
+  $("wb-analysis").innerHTML = wbAnalysisHtml();
+  $("wb-pr-only").onchange = (e) => { workbenchPrOnly = e.target.checked; paintWorkbenchV2(); };
+  document.querySelectorAll("[data-fb-run]").forEach((b) =>
+    (b.onclick = () => feedbackRule(b.dataset.fbRun, b.dataset.fbIdx, b.dataset.fbTitle, b.dataset.fbFile)));
+  bindEvalActions();
+  if (wbState.run) wbLoadDiff();
+}
+
+async function refreshWorkbenchData() {
+  if (location.hash !== "#/workbench") return;
+  try {
+    const [marks, run, evaluation] = await Promise.all([
+      api("/api/marks"), wbState.run ? api(`/api/runs/${wbState.run.id}`) : Promise.resolve(null),
+      api("/api/eval/last"),
+    ]);
+    wbState.marks = marks;
+    if (run) wbState.run = run;
+    wbState.eval = evaluation;
+    paintWorkbenchV2();
+  } catch (e) { toast(e.message, true); }
+}
+
 async function renderWorkbench() {
   clearInterval(refreshTimer);
   setTitle("工作台");
   showSkeleton();
-  let projects, metrics, evaluation, runs;
   try {
-    [projects, metrics, evaluation, runs] = await Promise.all([
-      api("/api/projects"), api("/api/metrics"), api("/api/eval/last"), api("/api/runs?limit=6"),
+    const [projects, metrics, evaluation, runs, marks] = await Promise.all([
+      api("/api/projects"), api("/api/metrics"), api("/api/eval/last"),
+      api("/api/runs?limit=40"), api("/api/marks"),
     ]);
+    Object.assign(wbState, { projects, metrics, eval: evaluation, runs, marks });
+    const first = wbPending()[0]?.run_id || wbRuns().find((r) => r.status === "blocked")?.id || wbRuns()[0]?.id;
+    const selected = wbPending().some((f) => f.run_id === wbState.run?.id) ||
+      wbRuns().some((r) => r.id === wbState.run?.id) ? wbState.run.id : first;
+    wbState.run = selected ? await api(`/api/runs/${selected}`) : null;
+    wbState.finding = wbState.run?.id === wbPending()[0]?.run_id ? wbPending()[0].idx : 0;
   } catch (e) { errorPanel(e.message); return; }
-  workbenchRuns = runs;
-  const seg = (val, label) =>
-    `<button class="ghost small-btn mark-btn${marksFilter.disposition === val ? " on" : ""}" data-mf="${val}">${label}</button>`;
-  const weeks = metrics.weeks || [];
-  const cases = evaluation.cases || [];
-  const hist = evaluation.history || [];
-  const running = !!(hist.length && hist[0].status === "running");
-  const pos = cases.filter((c) => c.polarity === "positive").length;
-  $app.innerHTML = `
-    ${pageHead({title: "工作台", sub: "团队视图 · 先看审查状态与待处置发现，再查看评测和趋势。"})}
-    <div class="actions" style="margin-bottom:12px;gap:10px">
-      <input id="wb-search" aria-label="搜索发现" placeholder="搜索发现、文件、项目或 run 编号" value="${esc(workbenchSearch)}" style="max-width:360px;flex:1">
-      <select id="mf-project" aria-label="筛选项目" style="width:auto"><option value="">全部项目</option>
-        ${projects.map((p) => `<option value="${p.id}" ${marksFilter.project_id === p.id ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select>
+  $app.innerHTML = `<div class="wb-page">
+    <div class="wb-top"><div><span class="wb-eyebrow">REVIEW OPERATIONS</span><h1>审查工作台</h1>
+      <p>先确认值得处理的发现，再用代码和评测判断下一步。</p></div>
+      <a class="wb-all-link" href="#/runs">浏览全部审查 ↗</a></div>
+    <div class="wb-toolbar">
+      <label class="wb-search"><span>⌕</span><input id="wb-search" aria-label="搜索审查和发现" placeholder="搜索发现、文件、项目、PR 或 run"
+        value="${esc(workbenchSearch)}"></label>
+      <select id="mf-project" aria-label="筛选项目"><option value="">全部项目</option>
+        ${wbState.projects.map((p) => `<option value="${p.id}" ${marksFilter.project_id === p.id ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select>
+      <div class="wb-summary"><span><b id="wb-pending-total">${wbPending().length}</b> 待处置</span>
+        <span><b id="wb-failed-total">${wbRuns().filter((r) => r.status === "failed").length}</b> 近期失败</span>
+        <span><b id="wb-running-total">${wbRuns().filter((r) => r.status === "running" || r.status === "queued").length}</b> 近期进行中</span></div>
     </div>
-    <div class="sec-title">近期审查 <span class="faint small">先确认 PR / 提交是否完成，再进入报告看证据 · <a href="#/runs">查看全部</a></span></div>
-    <div class="actions" style="margin-bottom:8px"><label class="small"><input id="wb-pr-only" type="checkbox" ${workbenchPrOnly ? "checked" : ""}> 只看 PR</label></div>
-    <div class="panel" id="wb-runs"></div>
-    <div class="sec-title">待处理发现 <span class="faint small">确认或标误报；点击发现进入报告查看代码、推理及门禁证据</span></div>
-    <div class="actions" id="mk-batch" style="display:none;margin-bottom:10px;border:1px solid var(--line);border-radius:6px;padding:8px 12px">
-      <span class="small">已选 <b id="mk-batch-count">0</b> 条</span>
-      <button class="small-btn" data-batch="confirmed">批量确认</button>
-      <button class="small-btn" data-batch="false_positive">批量标误报</button>
-    </div>
-    <div class="panel" id="mk-pending"></div>
-    <div class="sec-title">处理概况</div>
-    <div class="stats" id="mk-stats"></div>
-    <div class="sec-title">处置记录 <span class="faint small">误报可回流规则并保存为负例</span></div>
-    <div class="actions" style="margin-bottom:10px">${seg("", "全部")}${seg("false_positive", "误报")}${seg("confirmed", "确认")}</div>
-    <div class="panel" id="mk-ledger"></div>
-    <div class="sec-title">评测 <span class="faint small">检查规则或模型变更后是否漏报、是否重现误报</span></div>
-    <div class="panel" style="padding:16px 20px;margin-bottom:12px">
-      <div class="actions"><span id="eval-count">用例 <b>${cases.length}</b>（正 ${pos} · 负 ${cases.length - pos}）</span>
-        <button class="primary small-btn" id="eval-run" ${running || !cases.length ? "disabled" : ""}>${running ? "跑分进行中…" : "跑一轮评测"}</button></div>
-      <div class="hint">每轮保留配置快照及逐用例结果；用例数少时请按样本解释比率。</div>
-    </div>
-    ${hist.length ? evalRunHtml(hist[0], hist[1], {id: "eval-latest", open: running}) : `<div class="panel empty">尚无评测记录；先把已处置发现存为用例。</div>`}
-    <details class="panel" style="padding:12px 18px;margin-top:10px"><summary>评测用例与历史</summary>
-      <div id="eval-cases">${evalCasesHtml(cases)}</div>
-      ${hist.slice(1).map((h, i) => evalRunHtml(h, hist[i + 2])).join("")}</details>
-    <div class="sec-title">运行指标 <span class="faint small">近 8 周；率旁展示样本量</span></div>
-    <div class="panel">${weeks.length ? `<table><thead><tr><th>周</th><th>审查</th><th>发现问题</th><th>PR</th><th>误报 / 已处置</th><th>已创建回滚 PR</th></tr></thead><tbody>
-      ${weeks.map((w) => `<tr><td class="mono small">${esc(w.start || w.week)}</td>
-        <td><a href="#/runs?since=${esc(w.start || "")}">${w.runs}</a></td>
-        <td>${w.blocked}</td><td>${w.pr_runs}</td>
-        <td>${w.marked ? `${w.fp} / ${w.marked}（${w.fp_rate}%）` : "—"}</td>
-        <td>${w.reverted}</td></tr>`).join("")}</tbody></table>` : `<div class="empty">还没有审查数据</div>`}</div>`;
-  $("wb-search").oninput = (e) => { workbenchSearch = e.target.value.trim().toLowerCase(); paintWorkbenchRuns(); if (marksData) paintMarks(marksData); };
-  $("wb-pr-only").onchange = (e) => { workbenchPrOnly = e.target.checked; paintWorkbenchRuns(); };
-  $("mf-project").onchange = (e) => { marksFilter.project_id = +e.target.value || 0; paintWorkbenchRuns(); refreshMarks(); };
-  document.querySelectorAll("[data-mf]").forEach((b) =>
-    (b.onclick = () => { marksFilter.disposition = b.dataset.mf; refreshMarks(); }));
-  document.querySelectorAll("[data-batch]").forEach((b) =>
-    (b.onclick = () => batchMark(b.dataset.batch)));
-  bindEvalActions();
-  if (running) pollEval();
-  paintWorkbenchRuns();
-  refreshMarks();
+    <div class="wb-grid"><aside class="panel wb-queue" id="wb-queue"></aside>
+      <section class="panel wb-review" id="wb-review"></section></div>
+    <div id="wb-analysis"></div></div>`;
+  $("wb-search").oninput = (e) => { workbenchSearch = e.target.value.trim().toLowerCase(); paintWorkbenchV2(); };
+  $("mf-project").onchange = async (e) => {
+    marksFilter.project_id = +e.target.value || 0;
+    const first = wbPending()[0]?.run_id || wbRuns()[0]?.id;
+    if (!first) { wbState.run = null; wbState.finding = 0; }
+    if (first && wbState.run?.id !== first) {
+      try { wbState.run = await api(`/api/runs/${first}`); wbState.finding = 0; }
+      catch (err) { toast(err.message, true); }
+    }
+    paintWorkbenchV2();
+  };
+  paintWorkbenchV2();
+  if (wbState.eval.history?.[0]?.status === "running") pollEval();
 }
+
+document.addEventListener("click", async (e) => {
+  const runButton = e.target.closest("[data-wb-run]");
+  if (runButton) {
+    const id = +runButton.dataset.wbRun, idx = +(runButton.dataset.wbIdx || 0);
+    if (wbState.run?.id === id) { wbState.finding = idx; paintWorkbenchV2(); return; }
+    try {
+      wbState.run = await api(`/api/runs/${id}`);
+      wbState.finding = idx;
+      paintWorkbenchV2();
+    } catch (err) { toast(err.message, true); }
+    return;
+  }
+  const findingButton = e.target.closest("[data-wb-finding]");
+  if (findingButton) { wbState.finding = +findingButton.dataset.wbFinding; paintWorkbenchV2(); }
+});
 
 async function renderMarks() {
   clearInterval(refreshTimer);
@@ -776,9 +950,24 @@ async function renderProjects() {
       actions: `<button id="import-btn">从组织导入</button>
         <button class="primary" id="add-btn">接入项目</button>`,
     })}
-    <div id="proj-list" class="stagger">
-      ${projects.length ? projects.map(projectCard).join("")
-        : `<div class="panel empty">还没有接入项目 —— 点「接入项目」添加 GitHub 仓库或本地路径</div>`}
+    <div class="proj-layout">
+      <div id="proj-list" class="stagger">
+        ${projects.length ? projects.map(projectCard).join("")
+          : `<div class="panel empty">还没有接入项目 —— 点「接入项目」添加 GitHub 仓库或本地路径</div>`}
+      </div>
+      <aside class="panel proj-overview">
+        <div class="wb-eyebrow">REPOSITORY ACCESS</div>
+        <h2>接入概况</h2>
+        <div class="proj-overview-stats"><div><b>${projects.length}</b><span>仓库</span></div>
+          <div><b>${projects.filter((p) => p.enabled).length}</b><span>已启用</span></div>
+          <div><b>${connections.filter((c) => !c.disabled).length}</b><span>可用连接</span></div></div>
+        <div class="proj-overview-head"><b>GitHub 连接与项目</b><a href="#/settings/creds">管理连接 →</a></div>
+        ${connections.length ? connections.map((c) => `<div class="proj-connection">
+          <span class="dot ${c.disabled || c.last_error ? "failed" : "passed"}"></span>
+          <span><strong>${esc(c.label)}</strong><small>${esc(c.account_login || "账户未验证")} · ${c.project_count || 0} 个项目${c.disabled ? " · 已停用" : ""}</small></span>
+        </div>`).join("") : '<div class="wb-queue-empty">尚未配置连接，公开仓库可匿名只读审查。</div>'}
+        <div class="proj-overview-note">每个仓库可单独绑定一个连接；私有仓库和 webhook 需要对应连接具备权限。</div>
+      </aside>
     </div>
     <div id="add-area" style="margin-top:22px"></div>`;
 
@@ -1330,13 +1519,19 @@ function paintRunShell(run) {
     })}
     <div id="banner-box">${runBannerHtml(run)}</div>
     <div id="approval-box"></div>
-    <div class="sec-title">这次变更（谁 · 哪个分支 · 哪个提交 · 为什么改）</div>
-    <div class="panel ctx" id="run-kv">${runKvHtml(run)}</div>
-    <div class="sec-title">本次流水线（按哪层编排 · 每步的模型与环境）</div>
-    <div class="panel" id="run-pipeline" style="padding:12px 18px"></div>
-    <div id="findings-box"></div>
-    <div class="sec-title">审查过程（每一步做了什么 · 想了什么）</div>
-    <div class="panel" style="padding:6px 20px"><div class="steps" id="steps-list"></div></div>`;
+    <div class="run-layout">
+      <div class="run-main">
+        <div id="findings-box"></div>
+        <div class="sec-title">审查过程 <span class="small muted">展开步骤查看日志与推理</span></div>
+        <div class="panel" style="padding:6px 20px"><div class="steps" id="steps-list"></div></div>
+      </div>
+      <aside class="run-side">
+        <div class="sec-title">变更上下文</div>
+        <div class="panel ctx" id="run-kv">${runKvHtml(run)}</div>
+        <div class="sec-title">执行流水线</div>
+        <div class="panel" id="run-pipeline" style="padding:12px 18px"></div>
+      </aside>
+    </div>`;
 }
 
 function patchRunDynamic(prev, fresh) {
@@ -1546,7 +1741,8 @@ document.addEventListener("click", async (e) => {
   const b = e.target.closest("[data-copy-run]");
   if (!b) return;
   e.stopPropagation();
-  const run = runCache[+b.dataset.copyRun];
+  const run = runCache[+b.dataset.copyRun] ||
+    (wbState.run?.id === +b.dataset.copyRun ? wbState.run : null);
   const f = run && run.findings && run.findings[+b.dataset.copyIdx];
   if (!f) { toast("未取到该发现的完整内容（刷新页面后再试）", true); return; }
   const text = `【${f.severity === "IMPORTANT" ? "Important" : f.severity || "Nit"}】${f.title}\n`
