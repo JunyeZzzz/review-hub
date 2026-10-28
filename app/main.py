@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from . import config, connections, db, evaluator, github, worker
-from .engine import gates, prompts, reviewers
+from .engine import api_nodes, gates, prompts, reviewers
 
 app = FastAPI(title="Review Hub", docs_url=None, redoc_url=None)
 
@@ -201,17 +201,77 @@ def get_pipeline():
     return {"steps": worker.get_pipeline()}
 
 
+@app.get("/api/model-providers")
+def model_providers():
+    return [{"id": key, "label": label, "base_url": url, "protocol": protocol}
+            for key, (label, url, protocol) in api_nodes.PROVIDERS.items()]
+
+
+@app.get("/api/model-credentials")
+def model_credentials():
+    return api_nodes.list_public()
+
+
+@app.post("/api/model-credentials")
+def create_model_credential(body: dict):
+    try:
+        cid = api_nodes.create(str(body.get("label") or ""), str(body.get("provider") or ""),
+                               str(body.get("key") or ""), str(body.get("base_url") or ""))
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"id": cid}
+
+
+@app.put("/api/model-credentials/{cid}/key")
+def rotate_model_credential(cid: int, body: dict):
+    try:
+        api_nodes.rotate(cid, str(body.get("key") or ""))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True}
+
+
+@app.patch("/api/model-credentials/{cid}")
+def update_model_credential(cid: int, body: dict):
+    row = db.get("SELECT * FROM model_credentials WHERE id=?", (cid,))
+    if not row:
+        raise HTTPException(404, "模型凭证不存在")
+    if "disabled" in body:
+        db.execute("UPDATE model_credentials SET disabled=?,updated_at=? WHERE id=?",
+                   (int(bool(body["disabled"])), db.now(), cid))
+    return {"ok": True}
+
+
+@app.delete("/api/model-credentials/{cid}")
+def delete_model_credential(cid: int):
+    for raw in [db.get_setting("pipeline"), *[p["pipeline_json"] for p in
+                                                db.query("SELECT pipeline_json FROM projects")]]:
+        try:
+            if any(s.get("kind") == "api" and s.get("credential_id") == cid
+                   for s in json.loads(raw or "[]")):
+                raise HTTPException(409, "凭证仍被流水线节点引用，请先解绑")
+        except (ValueError, TypeError):
+            pass
+    try:
+        api_nodes.delete(cid)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {"ok": True}
+
+
 def _clean_pipeline(steps) -> list:
     """全局默认与项目级编排共用的校验/清洗。"""
-    if not isinstance(steps, list) or not steps:
-        raise HTTPException(400, "steps 必须是非空数组")
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 20:
+        raise HTTPException(400, "steps 必须包含 1 至 20 个节点")
     clean = []
     for s in steps:
+        if not isinstance(s, dict):
+            raise HTTPException(400, "节点必须是对象")
         kind = s.get("kind") or "reviewer"
         if kind == "gate":
             g = str(s.get("gate") or "tests")
             if g not in ("tests", "build", "semgrep"):
-                g = "tests"
+                raise HTTPException(400, "未知门禁类型")
             clean.append({
                 "id": str(s.get("id") or f"gate{len(clean)}")[:40],
                 "kind": "gate",
@@ -223,17 +283,43 @@ def _clean_pipeline(steps) -> list:
                 "image": str(s.get("image") or "")[:80],
             })
         elif kind == "reviewer":
+            provider = str(s.get("provider") or "claude")
+            if provider not in ("claude", "codex"):
+                raise HTTPException(400, "未知 Agent 执行器")
             clean.append({
                 "id": str(s.get("id") or f"step{len(clean)}")[:40],
                 "kind": "reviewer",
                 "name": str(s.get("name") or "评审步骤")[:40],
-                "provider": "codex" if s.get("provider") == "codex" else "claude",
+                "provider": provider,
                 "enabled": bool(s.get("enabled", True)),
                 "model": str(s.get("model") or "")[:80],
                 "prompt": str(s.get("prompt") or "")[:8000],
+                "purpose": "context" if s.get("purpose") == "context" else "findings",
             })
-    if not any(s["kind"] == "reviewer" for s in clean):
-        raise HTTPException(400, "至少要有一个评审步骤")
+        elif kind == "api":
+            cid = s.get("credential_id")
+            try:
+                api_nodes.get_active(int(cid))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, f"API 节点凭证无效：{exc}") from exc
+            if not str(s.get("model") or "").strip():
+                raise HTTPException(400, "API 节点必须填写模型 ID")
+            clean.append({
+                "id": str(s.get("id") or f"api{len(clean)}")[:40],
+                "kind": "api", "name": str(s.get("name") or "模型 API")[:40],
+                "credential_id": int(cid), "model": str(s["model"]).strip()[:80],
+                "prompt": str(s.get("prompt") or "")[:8000],
+                "purpose": "context" if s.get("purpose") == "context" else "findings",
+                "enabled": bool(s.get("enabled", True)),
+            })
+        else:
+            raise HTTPException(400, "未知节点类型")
+    if len({s["id"] for s in clean}) != len(clean):
+        raise HTTPException(400, "节点 ID 不能重复")
+    if len({s["name"] for s in clean}) != len(clean):
+        raise HTTPException(400, "节点名称不能重复，报告和交叉裁决需要区分来源")
+    if not any(s["kind"] in ("reviewer", "api") and s["purpose"] == "findings" and s["enabled"] for s in clean):
+        raise HTTPException(400, "至少启用一个产出审查发现的 Agent 或 API 节点")
     return clean
 
 

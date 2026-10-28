@@ -1,6 +1,7 @@
 """SQLite 持久层。线程内各自建连接（check_same_thread=False + 每次新连接）。"""
 import sqlite3
 import threading
+import json
 from datetime import datetime, timezone
 
 from . import config
@@ -62,6 +63,16 @@ CREATE TABLE IF NOT EXISTS github_connections (
   account_login TEXT,
   last_checked_at TEXT,
   last_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS model_credentials (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  label TEXT NOT NULL UNIQUE,
+  provider TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  secret_ref TEXT NOT NULL,
+  disabled INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -152,6 +163,30 @@ def init() -> None:
         if col not in ccols:
             c.execute(f"ALTER TABLE github_connections ADD COLUMN {col} TEXT")
     c.commit()
+    if get_setting("pipeline_node_migration_v1") != "done":
+        # 旧执行器曾在读取时隐式补测试门禁。迁移一次使真实执行顺序可见；
+        # 新配置删除门禁后不会再次自动补入。
+        old_global = get_setting("pipeline")
+        if old_global:
+            try:
+                steps = json.loads(old_global)
+                if isinstance(steps, list) and steps and not any(s.get("kind") == "gate" for s in steps):
+                    steps.insert(0, {"id": "gate-test", "kind": "gate", "name": "测试门禁",
+                                     "gate": "tests", "enabled": True})
+                    set_setting("pipeline", json.dumps(steps, ensure_ascii=False))
+            except (ValueError, TypeError, AttributeError):
+                pass
+        for row in query("SELECT id,pipeline_json FROM projects WHERE pipeline_json IS NOT NULL"):
+            try:
+                steps = json.loads(row["pipeline_json"])
+                if isinstance(steps, list) and steps and not any(s.get("kind") == "gate" for s in steps):
+                    steps.insert(0, {"id": "gate-test", "kind": "gate", "name": "测试门禁",
+                                     "gate": "tests", "enabled": True})
+                    execute("UPDATE projects SET pipeline_json=? WHERE id=?",
+                            (json.dumps(steps, ensure_ascii=False), row["id"]))
+            except (ValueError, TypeError, AttributeError):
+                pass
+        set_setting("pipeline_node_migration_v1", "done")
     from . import connections
     connections.migrate_legacy()
 

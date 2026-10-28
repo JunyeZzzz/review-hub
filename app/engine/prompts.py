@@ -114,7 +114,8 @@ def build(workdir: Path, intent: str = "", profile: str = "") -> dict:
         profile_section=profile_section,
     ), encoding="utf-8")
     return {"prompt_file": prompt_file, "diff_file": diff_file,
-            "diff_lines": len(lines), "truncated": truncated}
+            "diff_lines": len(lines), "truncated": truncated,
+            "intent": intent, "profile": profile}
 
 
 def _default_branch(workdir: Path) -> str:

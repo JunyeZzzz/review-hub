@@ -723,7 +723,7 @@ function qualityNext(d) {
     title: "回归评测正在运行", text: "逐条样本会重新评审；完成后检查漏报、误报重现和执行错误。",
     action: "查看评测进度", toggle: true };
   if (qualityNeedsRerun(d)) return { tone: "ready", label: "重新验证当前配置",
-    title: "配置或样本已变化", text: "上次结果不能代表当前全局配置和样本集，运行新一轮回归。",
+    title: "配置或样本已变化", text: "上次结果不能代表当前节点、规则和样本，运行新一轮回归。",
     action: "重新运行评测", runEval: true };
   const positiveCases = d.eval.cases.filter((c) => c.polarity === "positive").length;
   const confirmed = d.marks.marks.find((m) => m.disposition === "confirmed");
@@ -776,7 +776,7 @@ function qualityEvalHtml(d) {
     <p>${cases.length} 条回归样本：${positives} 条应报出，${cases.length - positives} 条不应再报出。</p>
     ${cases.length && !positives ? '<div class="qa-eval-note">目前只有负例，还不能检验真实问题是否漏报。</div>' : ""}
     ${h ? `<div class="qa-eval-counts"><span>漏报 <b>${h.miss || 0}</b></span><span>误报重现 <b>${h.fp || 0}</b></span><span>执行错误 <b>${h.error || 0}</b></span></div>` : ""}
-    ${changed ? '<div class="qa-eval-note">全局配置或样本数量已变化，建议重新运行评测。</div>' : ""}
+    ${changed ? '<div class="qa-eval-note">流水线、提示词、规则或样本数量已变化，建议重新运行评测。</div>' : ""}
     <div class="qa-eval-actions">
       <button class="primary small-btn" id="eval-run" ${!cases.length || h?.status === "running" ? "disabled" : ""}>${h?.status === "running" ? "评测进行中…" : "运行回归评测"}</button>
       <button class="ghost small-btn" data-qa-toggle="qa-details" aria-expanded="false">查看样本与逐项结果</button>
@@ -812,6 +812,22 @@ function qualityTrendHtml(d) {
       <b>${w.runs}</b><span>${esc(w.start || w.week)}</span></div>`).join("")
       : '<div class="qa-empty">还没有足够的审查数据。</div>'}</div>`;
 }
+function qualityLoopHtml(d) {
+  const cases = d.eval.cases || [], h = qualityLatest(d);
+  const positive = cases.filter((c) => c.polarity === "positive").length;
+  const negative = cases.length - positive;
+  return `<section class="qa-loop"><div class="qa-section-heading"><div><span class="wb-eyebrow">人工判断 → 可复用样本 → 回归信号</span>
+    <h2>判断怎样影响下一轮审查</h2></div><p>样本用于检验规则与模型改动；误报还可手动加入“不再报告”规则。不会自动训练模型。</p></div>
+    <div class="qa-loop-lanes">
+      <div class="qa-loop-lane positive"><div class="qa-loop-source"><span>报告中确认真实问题</span><strong>${d.marks.stats.confirmed}</strong><small>人工确认</small></div>
+        <span class="qa-loop-arrow">→</span><div class="qa-loop-sample"><span>应报出样本</span><strong>${positive}</strong><small>保存后成为回归基线</small></div>
+        <span class="qa-loop-arrow">→</span><div class="qa-loop-outcome"><span>改动后重新评审</span><strong>${h?.status === "done" && positive ? h.miss || 0 : "—"}</strong><small>漏报 · 应报却没报</small></div></div>
+      <div class="qa-loop-lane negative"><div class="qa-loop-source"><span>报告中标记误报</span><strong>${d.marks.stats.false_positive}</strong><small>人工排除</small></div>
+        <span class="qa-loop-arrow">→</span><div class="qa-loop-sample"><span>不应再报样本</span><strong>${negative}</strong><small>可同时修正“不再报告”规则</small></div>
+        <span class="qa-loop-arrow">→</span><div class="qa-loop-outcome"><span>改动后重新评审</span><strong>${h?.status === "done" && negative ? h.fp || 0 : "—"}</strong><small>误报重现 · 不应报却报了</small></div></div>
+    </div><div class="qa-loop-foot"><span>节点、提示词或规则改动</span><span>↶ 用同一批样本再次验证</span>
+      <a href="#/runs">到报告中判定并保存样本 →</a></div></section>`;
+}
 function qualityWorkbenchHtml(d) {
   const next = qualityNext(d), h = qualityLatest(d), cases = d.eval.cases.length;
   const nextAction = next.runEval
@@ -830,18 +846,7 @@ function qualityWorkbenchHtml(d) {
         <div class="qa-snapshot-row"><span>已保存的回归样本</span><strong>${cases}</strong></div>
         <div class="qa-snapshot-row"><span>上次回归</span><strong class="qa-snapshot-result">${qualityShortResult(h)}</strong></div>
       </section></div>
-    <section class="qa-process"><div class="qa-section-heading"><div><span class="wb-eyebrow">判断 → 沉淀 → 验证</span>
-      <h2>质量闭环怎么运作</h2></div><p>把人的判断变成可重复的检验，改规则后确认没有引入漏报。</p></div>
-      <div class="qa-process-grid">
-        <div class="panel qa-step"><span class="qa-step-num">01</span><h3>在报告里判定</h3>
-          <p>看完整发现，标记真实问题或误报。</p><span class="qa-step-foot">${d.marks.stats.pending} 条待判定</span></div>
-        <div class="panel qa-step"><span class="qa-step-num">02</span><h3>保存样本，修正规则</h3>
-          <p>真实问题存为“应报出”；误报可加入“不再报告”规则，同时存为“不应再报”样本。</p>
-          <span class="qa-step-foot">${cases} 条已保存</span></div>
-        <div class="panel qa-step"><span class="qa-step-num">03</span><h3>改动后运行回归</h3>
-          <p>检查应报出的问题有没有漏掉，误报有没有重新出现。</p>
-          <span class="qa-step-foot">${qualityResultLabel(h)}</span></div>
-      </div></section>
+    ${qualityLoopHtml(d)}
     <div class="qa-operate-grid">
       <section class="panel qa-operate"><div class="qa-card-heading"><div><h3>需要处理的报告</h3>
         <p>工作台只列任务；打开报告查看发现并完成处置。</p></div><a href="#/runs">查看全部 →</a></div>
@@ -1459,7 +1464,7 @@ function runPipelineHtml(run) {
   const chips = (snap.steps || []).map((s, i) => {
     const meta = s.kind === "gate"
       ? `${GATE_LABEL[s.gate] || s.gate}${s.sandbox === "docker" ? " · Docker" : " · 本机"}`
-      : `${s.provider}${s.model ? " · " + s.model : ""}`;
+      : `${s.kind === "api" ? "模型 API" : s.provider}${s.model ? " · " + s.model : ""}${s.purpose === "context" ? " · 上下文" : ""}`;
     const st = byName.get(s.name || s.id);
     const status = st ? st.status : "pending";
     if (status === "ok" || status === "fail" || status === "skip") done++;
@@ -2018,18 +2023,18 @@ async function renderSettings(tab = "pipeline") {
   } catch (e) { errorPanel(e.message); return; }
 
   if (tab === "pipeline") {
+    nodeCredentials = await api("/api/model-credentials");
     $app.innerHTML = `
     ${pageHead({ title: "流水线编排", sub: "全局默认；项目可在自己的「流水线」页覆盖" })}
     ${tabsHtml(tab)}
     <div class="panel stagger" style="padding:12px 20px">
       <div id="pipe-list"></div>
       <div class="actions" style="margin-top:12px">
-        <button id="pipe-add">添加评审步骤</button>
-        <button id="pipe-add-gate">添加门禁</button>
+        <button id="pipe-add">+ 添加节点</button>
         <button class="ghost" id="pipe-reset">恢复默认</button>
         <button class="primary" id="pipe-save">保存全局默认</button>
       </div>
-      <div class="hint" title="从上到下依次执行；风险路由/密钥扫描固定在流水线之前，裁决固定在最后。被 ≥2 个评审步骤同时报出的发现才升 Important（交叉确认），只启用一个评审步骤时不降级。列表里一个门禁都没有时，保存会自动补默认测试门禁——想关闭请停用而非删除。">门禁红灯即阻断、不调用模型；≥2 个评审报出同一问题才升 Important</div>
+      <div class="hint">风险路由和密钥扫描在节点之前执行；产出发现的节点参与最终裁决。门禁失败会停止执行。</div>
     </div>
     <div class="sec-title stagger">修改历史 <span class="faint small mono" style="letter-spacing:0;text-transform:none">每次保存自动留档 · 可一键恢复</span></div>
     <div class="panel stagger" style="padding:4px 18px" id="hist-pipeline"></div>`;
@@ -2037,16 +2042,7 @@ async function renderSettings(tab = "pipeline") {
     const list = $("pipe-list");
     const paint = () => { list.innerHTML = pipeListHTML(draft); bindPipeList(list, draft, paint); };
     paint();
-    $("pipe-add").onclick = () => {
-      draft.push({ id: `custom${Date.now() % 100000}`, kind: "reviewer",
-        name: `评审步骤 ${draft.length + 1}`, provider: "claude", enabled: true, model: "", prompt: "" });
-      paint();
-    };
-    $("pipe-add-gate").onclick = () => {
-      draft.push({ id: `gate${Date.now() % 100000}`, kind: "gate",
-        name: `门禁 ${draft.length}`, gate: "tests", enabled: true });
-      paint();
-    };
+    $("pipe-add").onclick = () => addPipeNode(draft, paint);
     $("pipe-reset").onclick = () => {
       draft.splice(0, draft.length,
         { id: "gate-test", kind: "gate", name: "测试门禁", gate: "tests", enabled: true },
@@ -2055,7 +2051,6 @@ async function renderSettings(tab = "pipeline") {
       paint();
     };
     $("pipe-save").onclick = async () => {
-      collectPipeDom(list, draft);
       try {
         await api("/api/pipeline", { method: "PUT", body: { steps: draft } });
         toast("全局默认编排已保存，下次评审生效");
@@ -2116,8 +2111,9 @@ async function renderSettings(tab = "pipeline") {
 
   // 凭证与模型
   const v = cfg.values;
-  let conns;
-  try { conns = await api("/api/github-connections"); }
+  let conns, modelCreds, providers;
+  try { [conns, modelCreds, providers] = await Promise.all([
+    api("/api/github-connections"), api("/api/model-credentials"), api("/api/model-providers")]); }
   catch (e) { errorPanel(e.message); return; }
   $app.innerHTML = `
   ${pageHead({ title: "凭证与模型", sub: "存库即生效，无需重启" })}
@@ -2136,7 +2132,23 @@ async function renderSettings(tab = "pipeline") {
       <div class="field"><label>GitHub Token</label><input id="c-new-token" type="password" autocomplete="new-password" placeholder="仅在创建时输入"></div>
     </div><button class="primary small-btn" id="c-new-save">添加连接</button>
   </div>
-  <div class="sec-title">模型凭证</div>
+  <div class="sec-title">模型 API 凭证 <span class="faint small">一个服务商可保存多组；节点按 ID 绑定</span></div>
+  <div class="panel model-credentials" style="padding:18px 20px;margin-bottom:18px">
+    ${modelCreds.length ? `<div class="model-credential-list">${modelCreds.map((c) => `<div class="model-credential-row">
+      <div><strong>${esc(c.label)}</strong><small>${esc(providers.find((p) => p.id === c.provider)?.label || c.provider)} · ${esc(c.base_url)}${c.disabled ? " · 已停用" : ""}</small></div>
+      <div class="actions"><button class="ghost small-btn" data-mc-rotate="${c.id}">更换 Key</button>
+        <button class="ghost small-btn" data-mc-toggle="${c.id}" data-disabled="${c.disabled}">${c.disabled ? "启用" : "停用"}</button>
+        <button class="danger-ghost small-btn" data-mc-delete="${c.id}">删除</button></div></div>`).join("")}</div>`
+      : '<p class="hint">还没有 API 凭证。添加后可在流水线中选择“模型 API”节点。</p>'}
+    <div class="model-credential-add"><div class="form-row">
+      <div class="field"><label>连接名称</label><input id="mc-label" placeholder="例如：团队 OpenAI / 预算 A"></div>
+      <div class="field"><span class="field-label">服务商</span><div class="choice-grid provider-choice">${providers.map((p, i) => `<label class="choice-tile"><input type="radio" name="mc-provider" value="${esc(p.id)}" ${i ? "" : "checked"}><span>${esc(p.label)}</span></label>`).join("")}</div></div>
+    </div><div class="form-row"><div class="field"><label>API Key</label><input type="password" id="mc-key" autocomplete="new-password" placeholder="保存后不再回显"></div>
+      <div class="field"><label>Base URL</label><input id="mc-url" placeholder="HTTPS API Base URL"></div></div>
+      <button class="primary small-btn" id="mc-save">添加模型凭证</button>
+      <span class="hint">模型 ID 在每个节点的配置弹窗填写；请求失败会在审查报告记录状态。</span></div>
+  </div>
+  <div class="sec-title">现有 Agent CLI 凭证与默认模型</div>
   <div class="panel stagger" style="padding:18px 20px">
     <div class="form-row">
       <div class="field"><label>Claude Token ${cfgBadge(v.claude_token_set)}</label>
@@ -2192,6 +2204,39 @@ async function renderSettings(tab = "pipeline") {
   document.querySelectorAll("[data-c-delete]").forEach((b) => b.onclick = async () => {
     if (!await uiConfirm("删除此连接？")) return;
     try { await api(`/api/github-connections/${b.dataset.cDelete}`, {method: "DELETE"}); renderSettings("creds"); }
+    catch (e) { toast(e.message, true); }
+  });
+  const urlInput = $("mc-url");
+  const selectedProvider = () => document.querySelector('input[name="mc-provider"]:checked')?.value || "openai";
+  const syncProvider = () => { const provider = selectedProvider();
+    urlInput.value = providers.find((p) => p.id === provider)?.base_url || "";
+    urlInput.placeholder = provider === "custom" ? "https://your-api.example/v1" : "HTTPS API Base URL"; };
+  document.querySelectorAll('input[name="mc-provider"]').forEach((input) => input.onchange = syncProvider);
+  syncProvider();
+  $("mc-save").onclick = async () => {
+    try {
+      await api("/api/model-credentials", { method: "POST", body: {
+        label: $("mc-label").value.trim(), provider: selectedProvider(),
+        key: $("mc-key").value, base_url: urlInput.value.trim() } });
+      toast("模型凭证已保存；可在流水线的 API 节点中使用"); renderSettings("creds");
+    } catch (e) { toast(e.message, true); }
+  };
+  document.querySelectorAll("[data-mc-rotate]").forEach((b) => b.onclick = async () => {
+    const key = await uiPrompt("更换模型 API Key", { message: "保存后旧 Key 会立即从服务端替换。", type: "password" });
+    if (!key) return;
+    try { await api(`/api/model-credentials/${b.dataset.mcRotate}/key`, { method: "PUT", body: { key } });
+      toast("API Key 已更换"); renderSettings("creds"); }
+    catch (e) { toast(e.message, true); }
+  });
+  document.querySelectorAll("[data-mc-toggle]").forEach((b) => b.onclick = async () => {
+    try { await api(`/api/model-credentials/${b.dataset.mcToggle}`, { method: "PATCH",
+      body: { disabled: b.dataset.disabled !== "1" } }); renderSettings("creds"); }
+    catch (e) { toast(e.message, true); }
+  });
+  document.querySelectorAll("[data-mc-delete]").forEach((b) => b.onclick = async () => {
+    if (!await uiConfirm("删除这组模型凭证？已绑定它的流水线节点需先改绑。")) return;
+    try { await api(`/api/model-credentials/${b.dataset.mcDelete}`, { method: "DELETE" });
+      toast("模型凭证已删除"); renderSettings("creds"); }
     catch (e) { toast(e.message, true); }
   });
   $("cfg-save").onclick = async () => {
@@ -2354,6 +2399,7 @@ async function renderProjectPipeline(pid) {
     ]);
   } catch (e) { errorPanel(e.message); return; }
   if (!p) { location.hash = "#/projects"; return; }
+  nodeCredentials = await api("/api/model-credentials");
 
   const draft = JSON.parse(JSON.stringify(pp.steps));
   $app.innerHTML = `
@@ -2368,10 +2414,9 @@ async function renderProjectPipeline(pid) {
     <div class="panel stagger" style="padding:12px 20px">
       <div id="pp-list"></div>
       <div class="actions" style="margin-top:12px">
-        <button id="pp-add">添加评审步骤</button>
-        <button id="pp-add-gate">添加门禁</button>
+        <button id="pp-add">+ 添加节点</button>
       </div>
-      <div class="hint" title="生效顺序：项目编排 > 全局默认；与全局相同，列表里没有门禁时会自动补默认测试门禁">只影响此项目；全局默认在配置中心维护</div>
+      <div class="hint">只影响此项目；每个模型节点读取本次审查里此前所有节点的最终输出。</div>
     </div>
 
     <div class="sec-title stagger">修改历史 <span class="faint small mono" style="letter-spacing:0;text-transform:none">此项目编排 · 每次保存自动留档</span></div>
@@ -2380,18 +2425,8 @@ async function renderProjectPipeline(pid) {
   const list = $("pp-list");
   const paint = () => { list.innerHTML = pipeListHTML(draft); bindPipeList(list, draft, paint); };
   paint();
-  $("pp-add").onclick = () => {
-    draft.push({ id: `custom${Date.now() % 100000}`, kind: "reviewer",
-      name: `评审步骤 ${draft.length + 1}`, provider: "claude", enabled: true, model: "", prompt: "" });
-    paint();
-  };
-  $("pp-add-gate").onclick = () => {
-    draft.push({ id: `gate${Date.now() % 100000}`, kind: "gate",
-      name: `门禁 ${draft.length}`, gate: "tests", enabled: true });
-    paint();
-  };
+  $("pp-add").onclick = () => addPipeNode(draft, paint);
   $("pp-save").onclick = async () => {
-    collectPipeDom(list, draft);
     try {
       await api(`/api/projects/${pid}/pipeline`, { method: "PUT", body: { steps: draft } });
       toast("已保存：此项目之后的审查按此编排执行");
@@ -2426,120 +2461,134 @@ const GATE_LABEL = { tests: "测试", build: "构建", semgrep: "安全扫描" }
 const GATE_TIP = "机械门禁：失败即红灯阻断，不调用模型；仓库无入口或部署机缺工具记 skip（安全扫描缺 semgrep 记红灯）";
 const SANDBOX_TIP = "本机=白名单环境变量执行（token 不进子进程）；Docker=一次性容器，断网+CPU/内存上限+依赖缓存卷，多项目并发互不影响。选 Docker 需本机装 Docker，缺失时该门禁红灯";
 
+let nodeCredentials = [];
+const NODE_KIND = { gate: "门禁", reviewer: "Agent", api: "模型 API" };
+const NODE_PURPOSE = { findings: "产出审查发现", context: "提供后续上下文" };
+function newPipeNode(kind, index) {
+  const base = { id: `node-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    kind, name: `${NODE_KIND[kind]}节点 ${index}`, enabled: true };
+  if (kind === "gate") return { ...base, gate: "tests", sandbox: "off", network: "install", image: "" };
+  if (kind === "api") return { ...base, credential_id: nodeCredentials.find((c) => !c.disabled)?.id || null,
+    model: "", purpose: "findings", prompt: "" };
+  return { ...base, provider: "claude", model: "", purpose: "findings", prompt: "" };
+}
 function pipeListHTML(draft) {
-  return draft.map((s, i) => {
+  return `<div class="node-flow-intro">按顺序执行 · 每个模型节点都读取此前全部节点的最终输出 · 失败会停止后续节点</div>
+    ${draft.map((s, i) => {
+      const cred = nodeCredentials.find((c) => c.id === s.credential_id);
+      const detail = s.kind === "gate" ? `${GATE_LABEL[s.gate] || s.gate} · ${s.sandbox === "docker" ? "Docker 沙盒" : "本机隔离"}`
+        : s.kind === "api" ? `${cred ? esc(cred.label) : "未绑定凭证"} · ${esc(s.model || "未填模型")}`
+        : `${s.provider === "codex" ? "Kimi / Codex" : "Claude Code"} · ${esc(s.model || "默认模型")}`;
+      return `<div class="node-flow-item"><div class="pipe-step ${s.enabled ? "" : "off"}" data-idx="${i}">
+        <div class="node-order"><span class="pipe-handle" draggable="true" data-drag="${i}" title="拖动调整顺序">⠿</span><b>${i + 1}</b></div>
+        <div class="node-body"><div class="node-title"><span class="node-kind ${s.kind}">${NODE_KIND[s.kind] || esc(s.kind)}</span>
+          <strong>${esc(s.name || "未命名节点")}</strong>${s.kind !== "gate" ? `<span class="node-purpose">${NODE_PURPOSE[s.purpose || "findings"]}</span>` : ""}</div>
+          <div class="node-description">${detail}</div></div>
+        <div class="node-actions"><label title="启用 / 停用"><input type="checkbox" data-en="${i}" ${s.enabled ? "checked" : ""}></label>
+          <button class="ghost small-btn" data-up="${i}" ${i ? "" : "disabled"} title="上移">↑</button>
+          <button class="ghost small-btn" data-down="${i}" ${i < draft.length - 1 ? "" : "disabled"} title="下移">↓</button>
+          <button class="ghost small-btn" data-edit="${i}">配置</button>
+          <button class="danger-ghost small-btn" data-del="${i}" title="从草稿删除节点">删除</button></div>
+      </div>${i < draft.length - 1 ? '<div class="node-connector"><span>完整上下文 ↓</span></div>' : ""}</div>`;
+    }).join("")}`;
+}
+function nodeField(label, input, hint = "") {
+  return `<label class="node-field"><span>${label}</span>${input}${hint ? `<small>${hint}</small>` : ""}</label>`;
+}
+function nodeChoiceField(label, name, items, selected, hint = "") {
+  return `<div class="node-field"><span>${label}</span><div class="choice-grid">${items.map(([value, text]) =>
+    `<label class="choice-tile"><input type="radio" name="${esc(name)}" value="${esc(value)}" ${String(value) === String(selected) ? "checked" : ""} required><span>${esc(text)}</span></label>`).join("")}</div>${hint ? `<small>${hint}</small>` : ""}</div>`;
+}
+function openNodeEditor(draft, index, repaint, onCancel = null) {
+  const s = { ...draft[index] };
+  const dialog = document.createElement("dialog");
+  dialog.className = "rh-dialog node-dialog";
+  const common = nodeField("节点名称", `<input name="name" value="${esc(s.name || "")}" maxlength="40" required>`);
+  let specific = "";
+  if (s.kind === "gate") {
+    specific = nodeChoiceField("门禁任务", "gate", Object.entries(GATE_LABEL), s.gate, GATE_TIP)
+      + nodeChoiceField("执行环境", "sandbox", [["off", "本机隔离"], ["docker", "Docker 沙盒"]], s.sandbox || "off", SANDBOX_TIP)
+      + nodeChoiceField("Docker 网络", "network", [["install", "仅安装依赖时联网"], ["off", "完全断网"], ["on", "全程联网"]], s.network || "install")
+      + nodeField("Docker 镜像", `<input name="image" value="${esc(s.image || "")}" maxlength="80" placeholder="留空按仓库自动选择">`);
+  } else {
+    specific = nodeChoiceField("节点作用", "purpose", [["findings", "产出审查发现（参与裁决）"], ["context", "提供分析上下文（不参与裁决）"]], s.purpose || "findings",
+      "上下文节点的完整输出会传给之后所有模型节点；发现节点必须返回 findings JSON。")
+      + (s.kind === "api"
+        ? nodeChoiceField("模型凭证", "credential_id", nodeCredentials.filter((c) => !c.disabled).map((c) => [c.id, `${c.label} · ${c.provider}`]), s.credential_id,
+          '在“凭证与模型”里可添加 OpenAI、Anthropic、Gemini、DeepSeek 等连接。')
+        : nodeChoiceField("Agent 执行器", "provider", [["claude", "Claude Code"], ["codex", "Kimi / Codex"]], s.provider || "claude"))
+      + nodeField("模型 ID", `<input name="model" value="${esc(s.model || "")}" maxlength="80" ${s.kind === "api" ? "required" : ""} placeholder="${s.kind === "api" ? "填写服务商模型 ID" : "留空使用默认模型"}">`)
+      + nodeField("本节点任务与侧重点", `<textarea name="prompt" rows="7" maxlength="8000" placeholder="说明本节点要重点检查什么；基础审查规则与前序上下文会自动附加">${esc(s.prompt || "")}</textarea>`);
+  }
+  dialog.innerHTML = `<form method="dialog" class="rh-dialog-inner"><div class="node-dialog-head"><div><span class="node-kind ${s.kind}">${NODE_KIND[s.kind]}</span>
+      <h2>配置节点 ${index + 1}</h2></div><button type="button" class="ghost" data-close aria-label="关闭">×</button></div>
+      ${common}${specific}<div class="rh-dialog-actions"><button type="button" class="ghost" data-close>取消</button>
+      <button type="submit" class="primary">应用到草稿</button></div></form>`;
+  document.body.appendChild(dialog);
+  const close = (cancelled = false) => { dialog.close(); dialog.remove(); if (cancelled) onCancel?.(); };
+  dialog.querySelectorAll("[data-close]").forEach((b) => b.onclick = () => close(true));
+  dialog.addEventListener("cancel", (e) => { e.preventDefault(); close(true); });
+  dialog.querySelector("form").onsubmit = (e) => {
+    e.preventDefault();
+    const data = new FormData(e.currentTarget);
+    s.name = String(data.get("name") || "").trim();
+    if (!s.name) return;
     if (s.kind === "gate") {
-      return `<div class="pipe-step ${s.enabled ? "" : "off"}" data-idx="${i}">
-        <div class="pipe-main">
-          <span class="pipe-handle" draggable="true" data-drag="${i}" title="拖拽排序">⠿</span>
-          <span class="pipe-num mono">${i + 1}</span>
-          <input type="checkbox" class="pipe-en" data-en="${i}" ${s.enabled ? "checked" : ""} title="启用/停用">
-          <input class="pipe-name" data-name="${i}" value="${esc(s.name || "")}">
-          <select class="pipe-provider" data-gate="${i}" title="${GATE_TIP}">
-            ${Object.entries(GATE_LABEL).map(([g, label]) =>
-              `<option value="${g}" ${s.gate === g ? "selected" : ""}>${label}门禁</option>`).join("")}
-          </select>
-          <select class="pipe-provider" data-sandbox="${i}" title="${SANDBOX_TIP}">
-            <option value="off" ${s.sandbox !== "docker" ? "selected" : ""}>本机隔离</option>
-            <option value="docker" ${s.sandbox === "docker" ? "selected" : ""}>Docker 沙盒</option>
-          </select>
-          <select class="pipe-provider" data-network="${i}" ${s.sandbox !== "docker" ? "disabled" : ""}
-                  title="仅 Docker 沙盒生效：断网=完全离线（需仓库自带依赖）；仅安装期放网=先联网装依赖再断网跑测试（默认）；全程放网=最弱（go 拉模块需要）">
-            <option value="install" ${(s.network || "install") === "install" ? "selected" : ""}>安装期放网</option>
-            <option value="off" ${s.network === "off" ? "selected" : ""}>断网</option>
-            <option value="on" ${s.network === "on" ? "selected" : ""}>全程放网</option>
-          </select>
-          <input class="pipe-model" data-image="${i}" value="${esc(s.image || "")}"
-                 placeholder="镜像（留空自动：node/go/python）" title="Docker 镜像；留空按仓库特征自动选择">
-          <span class="pipe-ops">
-            <button class="danger-ghost small-btn" data-del="${i}">删除</button>
-          </span>
-        </div>
-      </div>`;
+      s.gate = data.get("gate"); s.sandbox = data.get("sandbox");
+      s.network = data.get("network"); s.image = String(data.get("image") || "").trim();
+    } else {
+      s.purpose = data.get("purpose"); s.model = String(data.get("model") || "").trim();
+      s.prompt = String(data.get("prompt") || "").trim();
+      if (s.kind === "api") s.credential_id = +data.get("credential_id");
+      else s.provider = data.get("provider");
     }
-    return `<div class="pipe-step ${s.enabled ? "" : "off"}" data-idx="${i}">
-      <div class="pipe-main">
-        <span class="pipe-handle" draggable="true" data-drag="${i}" title="拖拽排序">⠿</span>
-        <span class="pipe-num mono">${i + 1}</span>
-        <input type="checkbox" class="pipe-en" data-en="${i}" ${s.enabled ? "checked" : ""} title="启用/停用">
-        <input class="pipe-name" data-name="${i}" value="${esc(s.name || "")}">
-        <select class="pipe-provider" data-provider="${i}">
-          <option value="claude" ${s.provider !== "codex" ? "selected" : ""}>Claude</option>
-          <option value="codex" ${s.provider === "codex" ? "selected" : ""}>Kimi</option>
-        </select>
-        <input class="pipe-model" data-model="${i}" value="${esc(s.model || "")}" placeholder="模型（留空=默认）">
-        <span class="pipe-ops">
-          <button class="danger-ghost small-btn" data-del="${i}">删除</button>
-        </span>
-      </div>
-      <details class="pipe-prompt">
-        <summary>此步骤专属提示词（留空用全局）</summary>
-        <textarea class="profile-edit" data-pp="${i}" rows="5">${esc(s.prompt || "")}</textarea>
-      </details>
-    </div>`;
-  }).join("");
+    draft[index] = s;
+    close(); repaint();
+  };
+  dialog.showModal();
+  dialog.querySelector('[name="name"]').focus();
 }
-
-/* 从 DOM 收集未触发 oninput 的最新值回填 draft */
-function collectPipeDom(root, draft) {
-  root.querySelectorAll("[data-name]").forEach((el) => draft[+el.dataset.name].name = el.value);
-  root.querySelectorAll("[data-model]").forEach((el) => draft[+el.dataset.model].model = el.value);
-  root.querySelectorAll("[data-pp]").forEach((el) => draft[+el.dataset.pp].prompt = el.value);
-  root.querySelectorAll("[data-provider]").forEach((el) => draft[+el.dataset.provider].provider = el.value);
-  root.querySelectorAll("[data-gate]").forEach((el) => draft[+el.dataset.gate].gate = el.value);
-  root.querySelectorAll("[data-sandbox]").forEach((el) => draft[+el.dataset.sandbox].sandbox = el.value);
-  root.querySelectorAll("[data-network]").forEach((el) => draft[+el.dataset.network].network = el.value);
-  root.querySelectorAll("[data-image]").forEach((el) => draft[+el.dataset.image].image = el.value);
-}
-
-/* 编辑器绑定：结构性变更（拖拽/删除）后调 repaint() 重画 */
-function bindPipeList(root, draft, repaint) {
-  let dragIdx = null;
-  root.querySelectorAll(".pipe-handle").forEach((h) => {
-    h.addEventListener("dragstart", (e) => {
-      dragIdx = +h.dataset.drag;
-      e.dataTransfer.effectAllowed = "move";
-      e.dataTransfer.setData("text/plain", String(dragIdx));
-    });
-    h.addEventListener("dragend", () => {
-      dragIdx = null;
-      root.querySelectorAll(".pipe-step").forEach((el) => el.classList.remove("drag-over"));
-    });
-  });
-  root.querySelectorAll(".pipe-step").forEach((el) => {
-    el.addEventListener("dragover", (e) => { e.preventDefault(); el.classList.add("drag-over"); });
-    el.addEventListener("dragleave", () => el.classList.remove("drag-over"));
-    el.addEventListener("drop", (e) => {
-      e.preventDefault();
-      el.classList.remove("drag-over");
-      if (dragIdx == null) return;
-      const from = dragIdx, to = +el.dataset.idx;
-      if (from === to) return;
-      const [moved] = draft.splice(from, 1);
-      draft.splice(to, 0, moved);
-      dragIdx = null;
-      repaint();
-    });
-  });
-  root.querySelectorAll("[data-del]").forEach((b) => b.onclick = () => {
-    draft.splice(+b.dataset.del, 1);
+async function addPipeNode(draft, repaint) {
+  const kind = await uiChoice("添加流水线节点", [
+    { value: "gate", label: "门禁 · 执行测试、构建或安全扫描" },
+    { value: "reviewer", label: "Agent · 可读取仓库并调用工具" },
+    { value: "api", label: "模型 API · 通过凭证调用服务商" },
+  ], "节点按顺序执行；之后的模型节点都能读取前序节点的结果。");
+  if (!kind) return;
+  const node = newPipeNode(kind, draft.length + 1);
+  draft.push(node);
+  repaint();
+  openNodeEditor(draft, draft.length - 1, repaint, () => {
+    const i = draft.findIndex((s) => s.id === node.id);
+    if (i >= 0) draft.splice(i, 1);
     repaint();
   });
+}
+function bindPipeList(root, draft, repaint) {
+  const move = (from, to) => {
+    if (to < 0 || to >= draft.length || from === to) return;
+    const [node] = draft.splice(from, 1);
+    draft.splice(to, 0, node);
+    repaint();
+  };
+  root.querySelectorAll("[data-up]").forEach((b) => b.onclick = () => move(+b.dataset.up, +b.dataset.up - 1));
+  root.querySelectorAll("[data-down]").forEach((b) => b.onclick = () => move(+b.dataset.down, +b.dataset.down + 1));
+  root.querySelectorAll("[data-edit]").forEach((b) => b.onclick = () => openNodeEditor(draft, +b.dataset.edit, repaint));
+  root.querySelectorAll("[data-del]").forEach((b) => b.onclick = () => { draft.splice(+b.dataset.del, 1); repaint(); });
   root.querySelectorAll("[data-en]").forEach((c) => c.onchange = () => {
     draft[+c.dataset.en].enabled = c.checked;
     c.closest(".pipe-step").classList.toggle("off", !c.checked);
   });
-  root.querySelectorAll("[data-name]").forEach((el) => el.oninput = () => { draft[+el.dataset.name].name = el.value; });
-  root.querySelectorAll("[data-gate]").forEach((el) => el.onchange = () => { draft[+el.dataset.gate].gate = el.value; });
-  root.querySelectorAll("[data-sandbox]").forEach((el) => el.onchange = () => {
-    draft[+el.dataset.sandbox].sandbox = el.value;
-    repaint();   // 切沙盒模式时刷新「网络」下拉的可用状态
+  let dragIndex = null;
+  root.querySelectorAll("[data-drag]").forEach((h) => {
+    h.ondragstart = (e) => { dragIndex = +h.dataset.drag; e.dataTransfer.setData("text/plain", String(dragIndex)); };
   });
-  root.querySelectorAll("[data-network]").forEach((el) => el.onchange = () => { draft[+el.dataset.network].network = el.value; });
-  root.querySelectorAll("[data-image]").forEach((el) => el.oninput = () => { draft[+el.dataset.image].image = el.value; });
-  root.querySelectorAll("[data-model]").forEach((el) => el.oninput = () => { draft[+el.dataset.model].model = el.value; });
-  root.querySelectorAll("[data-provider]").forEach((el) => el.onchange = () => { draft[+el.dataset.provider].provider = el.value; });
-  root.querySelectorAll("[data-pp]").forEach((el) => el.oninput = () => { draft[+el.dataset.pp].prompt = el.value; });
+  root.querySelectorAll(".pipe-step").forEach((el) => {
+    el.ondragover = (e) => { e.preventDefault(); el.classList.add("drag-over"); };
+    el.ondragleave = () => el.classList.remove("drag-over");
+    el.ondrop = (e) => { e.preventDefault(); el.classList.remove("drag-over");
+      if (dragIndex != null) move(dragIndex, +el.dataset.idx); dragIndex = null; };
+  });
 }
 
 navigate();

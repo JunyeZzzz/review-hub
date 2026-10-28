@@ -1,8 +1,8 @@
 """评审评测集：用已知正确答案回归测试当前评审配置（提示词/模型/编排）。
 
-MVP 范围与规则：
+范围与规则：
 - 用例来自报告页的人工处置：确认的 Important = 正例（应报出）；误报 = 负例（不应再报出）；
-- 只跑评审步骤（门禁是确定性的，不参与跑分），复用当前生效编排（项目覆盖 > 全局默认）；
+- 按当前生效编排运行节点；门禁不计入命中率，但其结果进入后续节点上下文；
 - 命中判定与裁决层同一把尺子（verdict.similar：同文件 ±15 行 + 标题相似度）；
 - 后台线程跑，逐用例落库进度；同一时间只允许一轮评测。
 """
@@ -14,16 +14,32 @@ import tempfile
 from pathlib import Path
 
 from . import config, db, worker
-from .engine import prompts, verdict
+from .engine import gates, prompts, verdict
 
 _eval_lock = threading.Lock()
 
 
 def _config_snapshot() -> str:
+    def signature(steps):
+        return [f"{s.get('id')}:{s.get('kind')}:{s.get('gate') or s.get('provider') or s.get('credential_id')}:"
+                f"{s.get('model')}:{s.get('purpose','findings')}:"
+                f"{hashlib.sha256(json.dumps(s, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:10]}"
+                for s in steps if s.get("enabled", True)]
+    project_ids = [r["project_id"] for r in db.query("SELECT DISTINCT project_id FROM eval_cases ORDER BY project_id")]
+    global_steps = worker.get_pipeline()
+    project_steps = {str(pid): worker.get_pipeline(db.get("SELECT * FROM projects WHERE id=?", (pid,)))
+                     for pid in project_ids if db.get("SELECT id FROM projects WHERE id=?", (pid,))}
+    used_credentials = {s.get("credential_id") for steps in [global_steps, *project_steps.values()]
+                        for s in steps if s.get("kind") == "api"}
+    credentials = {str(r["id"]): r["updated_at"] for r in db.query(
+        "SELECT id,updated_at FROM model_credentials ORDER BY id") if r["id"] in used_credentials}
     return json.dumps({
         "prompt": hashlib.md5(prompts.get_template().encode()).hexdigest()[:8],
-        "pipeline": [f"{s.get('kind')}:{s.get('gate') or s.get('provider')}:{s.get('model')}"
-                     for s in worker.get_pipeline() if s.get("enabled", True)],
+        "rules": hashlib.sha256((config.POLICY_DIR / "REVIEW.md").read_bytes()).hexdigest()[:10],
+        "cases": [r["id"] for r in db.query("SELECT id FROM eval_cases ORDER BY id")],
+        "credentials": credentials,
+        "pipeline": signature(global_steps),
+        "projects": {pid: signature(steps) for pid, steps in project_steps.items()},
     }, ensure_ascii=False)
 
 
@@ -76,11 +92,32 @@ def _run_case(case: dict) -> dict:
         built = prompts.build(workdir, intent=case["intent"] or "", profile=project["profile"] or "")
         diff_text = built["diff_file"].read_text(encoding="utf-8")
         outs = []
+        prior = []
+        diff_files = [line[6:] for line in diff_text.splitlines() if line.startswith("+++ b/")]
         for step in worker.get_pipeline(project):
-            if not step.get("enabled", True) or step.get("kind") == "gate":
+            if not step.get("enabled", True):
                 continue
-            text, _ = worker._run_reviewer_step(step, project, workdir, built, diff_text)
-            outs.append((step.get("name") or step.get("id", "评审"), text))
+            if step.get("kind") == "gate":
+                kw = {"cfg": step, "cache_id": f"eval-{case['id']}"}
+                gtype = step.get("gate", "tests")
+                if gtype == "semgrep":
+                    gate_result = gates.run_semgrep(workdir, diff_files, **kw)
+                elif gtype == "build":
+                    gate_result = gates.run_build(workdir, **kw)
+                else:
+                    gate_result = gates.run_tests(workdir, **kw)
+                prior.append({"name": step.get("name") or "门禁", "status": gate_result["status"],
+                              "output": gate_result.get("log", "")})
+                if gate_result["status"] == "fail":
+                    raise RuntimeError(f"评测门禁失败：{step.get('name') or gtype}")
+                continue
+            text, _, _ = worker._run_reviewer_step(step, project, workdir, built, diff_text, prior)
+            name = step.get("name") or step.get("id", "评审")
+            prior.append({"name": name, "status": "ok", "output": text})
+            if step.get("purpose", "findings") == "findings":
+                if verdict.extract_findings(text) is None:
+                    raise RuntimeError(f"{name} 未返回有效 findings JSON")
+                outs.append((name, text))
         merged = verdict.merge_multi(outs)
     except Exception as e:
         return {**base, "result": "error", "detail": str(e)[-300:]}

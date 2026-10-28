@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import config, connections, db, github
 from .git_auth import auth_env
-from .engine import gates, prompts, reviewers, router, verdict
+from .engine import api_nodes, gates, prompts, reviewers, router, verdict
 
 CLONE_DEPTH_ARGS = ["--filter=blob:none"]
 
@@ -68,9 +68,7 @@ def _load_steps(raw) -> list | None:
 
 
 def get_pipeline(project: dict | None = None) -> list:
-    """生效编排：项目覆盖（projects.pipeline_json）> 全局默认（settings 表）。
-    任一层都没有门禁步骤时自动补默认测试门禁——机械防线不允许被静默删光，
-    配置里出现任一门禁步骤（含停用的）即视为已有意识接管。"""
+    """生效编排：项目覆盖 > 全局默认；返回用户看到的真实节点顺序。"""
     raw = None
     if project is not None:
         try:
@@ -80,26 +78,67 @@ def get_pipeline(project: dict | None = None) -> list:
     steps = _load_steps(raw) or _load_steps(db.get_setting("pipeline"))
     if steps is None:
         steps = json.loads(json.dumps(DEFAULT_PIPELINE))
-    if not any(s.get("kind") == "gate" for s in steps):
-        steps = [dict(DEFAULT_GATE)] + steps
     return steps
 
 
-def _run_reviewer_step(step: dict, project: dict, workdir: Path,
-                       built: dict, diff_text: str):
-    """执行一个评审步骤，返回 (输出文本, 轨迹, 实际使用的提示词全文)。"""
-    provider = step.get("provider", "claude")
-    prompt_file = built["prompt_file"]
+MAX_NODE_PROMPT_CHARS = 500_000
+MAX_NODE_OUTPUT_CHARS = 200_000
+
+
+def _node_prompt(step: dict, built: dict, prior: list[dict], workdir: Path,
+                 *, api: bool = False) -> str:
+    """每个模型节点拿到全部前序节点的最终输出；超出上限显式失败。"""
+    purpose = step.get("purpose", "findings")
+    if purpose == "context":
+        base = (f"你在代码审查流水线中负责：{step.get('name', '分析')}。"
+                "只输出供后续节点使用的事实和判断，不必输出 findings JSON。\n"
+                f"仓库：{workdir}\n变更 diff：{built['diff_file']}\n"
+                f"评审规则：{config.POLICY_DIR / 'REVIEW.md'}\n"
+                f"项目背景：{built.get('profile') or '未提供'}\n"
+                f"本次变更目的：{built.get('intent') or '未提供'}\n")
+    else:
+        base = built["prompt_file"].read_text(encoding="utf-8")
     if step.get("prompt"):
-        # 步骤级提示词覆盖：直接作为完整 prompt
-        pf = workdir / f".hub-prompt-{step.get('id', 'x')}.txt"
-        pf.write_text(step["prompt"], encoding="utf-8")
-        prompt_file = pf
+        base += "\n## 本节点任务与侧重点\n" + step["prompt"] + "\n"
+    if api:
+        base += ("\n## API 节点能力边界\n本节点没有 Read/Grep/Glob 或仓库文件工具。"
+                 "以下 diff 与规则已经内联；只根据可见证据判断，无法验证的猜测不要报出。\n")
+        base += ("\n## API 节点可直接读取的变更 diff\n"
+                 + built["diff_file"].read_text(encoding="utf-8")
+                 + "\n## 评审规则\n"
+                 + (config.POLICY_DIR / "REVIEW.md").read_text(encoding="utf-8"))
+    if prior:
+        base += "\n## 所有前序节点的最终上下文（按执行顺序）\n"
+        for i, item in enumerate(prior, 1):
+            base += f"\n### {i}. {item['name']} [{item['status']}]\n{item['output']}\n"
+    if len(base) > MAX_NODE_PROMPT_CHARS:
+        raise RuntimeError(f"节点输入 {len(base)} 字符超过 {MAX_NODE_PROMPT_CHARS} 上限；请缩小 diff 或前序输出")
+    return base
+
+
+def _run_reviewer_step(step: dict, project: dict, workdir: Path,
+                       built: dict, diff_text: str, prior: list[dict] | None = None):
+    """执行 Agent 或 API 节点，返回 (输出文本, 轨迹, 实际输入)。"""
+    prior = prior or []
+    is_api = step.get("kind") == "api"
+    prompt_text = _node_prompt(step, built, prior, workdir, api=is_api)
+    if is_api:
+        text = api_nodes.run(step, prompt_text)
+        if len(text) > MAX_NODE_OUTPUT_CHARS:
+            raise RuntimeError(f"节点输出超过 {MAX_NODE_OUTPUT_CHARS} 字符上限")
+        return text, None, prompt_text
+    provider = step.get("provider", "claude")
+    prompt_file = workdir / f".hub-node-{len(prior)}.txt"
+    prompt_file.write_text(prompt_text, encoding="utf-8")
     if provider == "claude":
         text, trace = reviewers.run_claude(workdir, prompt_file, step.get("model") or "")
-    else:
+    elif provider == "codex":
         text, trace = reviewers.run_codex(workdir, prompt_file, step.get("model") or "")
-    return text, trace, prompt_file.read_text(encoding="utf-8")
+    else:
+        raise RuntimeError(f"未知 Agent 执行器：{provider}")
+    if len(text) > MAX_NODE_OUTPUT_CHARS:
+        raise RuntimeError(f"节点输出超过 {MAX_NODE_OUTPUT_CHARS} 字符上限")
+    return text, trace, prompt_text
 
 
 def _git_retry(workdir: Path | None, *args: str, attempts: int = 4,
@@ -159,11 +198,13 @@ class StepLog:
         return time.time()
 
     def finish(self, t0: float, status: str, log: str = "", trace=None, prompt=None) -> None:
+        stored_log = log if len(log) <= MAX_NODE_OUTPUT_CHARS else (
+            log[:MAX_NODE_OUTPUT_CHARS] + "\n[报告日志已截断；执行时使用的完整输出仍传给后续节点]")
         db.execute(
             "UPDATE steps SET status=?, log=?, trace=?, prompt=?, duration_ms=?, finished_at=? WHERE id=?",
-            (status, log[-20000:],
+            (status, stored_log,
              json.dumps(trace, ensure_ascii=False) if trace else None,
-             prompt[-60000:] if prompt else None,
+             prompt if prompt else None,
              int((time.time() - t0) * 1000), db.now(), self.step_id))
         self.idx += 1
 
@@ -308,28 +349,28 @@ def _process_run(run, project) -> None:
                               for f in scan["findings"]])
             return
 
-        # 流水线：门禁（机械）+ 评审（AI）按生效编排执行（项目覆盖 > 全局默认）；门禁红灯即阻断
+        # 流水线逐节点执行；每个模型节点接收全部前序节点的最终结果。
         pipeline = [s for s in get_pipeline(project) if s.get("enabled", True)]
         # 编排回显：本次到底按哪层配置执行的（coder 验证"自编排真的生效"的依据）
         db.execute("UPDATE runs SET pipeline_snapshot=? WHERE id=?",
                    (json.dumps({
                        "source": "project" if (project["pipeline_json"] or "").strip() else "global",
                        "steps": pipeline}, ensure_ascii=False), run_id))
-        reviewer_steps = [s for s in pipeline if s.get("kind", "reviewer") != "gate"]
-        if not tier_info["run_ai"] or not reviewer_steps:
-            sl.start("AI 评审（跳过）")
-            sl.finish(time.time(), "skip",
-                      f"tier={tier_info['tier']}，按规则跳过 AI 评审" if not tier_info["run_ai"]
-                      else "流水线里没有启用的评审步骤")
+        reviewer_steps = [s for s in pipeline if s.get("kind", "reviewer") in ("reviewer", "api")
+                          and s.get("purpose", "findings") == "findings"]
+        if not reviewer_steps:
+            raise RuntimeError("流水线没有启用的发现节点，不能判定通过")
 
         reviewers_out = []   # (步骤名, 输出文本)
+        prior = []           # 本次执行的全部前序节点最终上下文
         built = None
         for step in pipeline:
             if step.get("kind") == "gate":
-                if _run_gate(step, project, run, workdir, diff_files, sl):
+                blocked, gate_status, gate_output = _run_gate(step, project, run, workdir, diff_files, sl)
+                prior.append({"name": step.get("name") or "门禁", "status": gate_status,
+                              "output": gate_output})
+                if blocked:
                     return   # 门禁红灯已收尾（fail loud），后续步骤不再执行
-                continue
-            if not tier_info["run_ai"]:
                 continue
             if built is None:
                 built = prompts.build(workdir, intent=intent, profile=project["profile"] or "")
@@ -337,9 +378,13 @@ def _process_run(run, project) -> None:
             name = step.get("name") or step.get("id", "评审")
             t0 = sl.start(name)
             try:
-                text, trace, prompt_text = _run_reviewer_step(step, project, workdir, built, diff_text)
+                text, trace, prompt_text = _run_reviewer_step(step, project, workdir, built, diff_text, prior)
+                if step.get("purpose", "findings") == "findings" and verdict.extract_findings(text) is None:
+                    raise RuntimeError("节点未返回有效 findings JSON，不能判定通过")
                 sl.finish(t0, "ok", log=text, trace=trace, prompt=prompt_text)
-                reviewers_out.append((name, text))
+                prior.append({"name": name, "status": "ok", "output": text})
+                if step.get("purpose", "findings") == "findings":
+                    reviewers_out.append((name, text))
             except Exception as e:
                 sl.finish(t0, "fail", str(e))
                 raise   # fail loud：评审步骤失败 -> 整个 run 红灯
@@ -347,8 +392,8 @@ def _process_run(run, project) -> None:
         # 裁决：多评审者交叉合并
         t0 = sl.start("交叉裁决")
         try:
-            if tier_info["run_ai"] and not reviewers_out:
-                raise RuntimeError("本次风险等级要求 AI 评审，但没有有效评审步骤")
+            if not reviewers_out:
+                raise RuntimeError("流水线没有有效的发现节点")
             if any(verdict.extract_findings(output) is None for _, output in reviewers_out):
                 raise RuntimeError("评审器未返回有效 findings JSON，不能判定通过")
             merged = verdict.merge_multi(reviewers_out)
@@ -375,8 +420,8 @@ def _process_run(run, project) -> None:
 
 
 def _run_gate(step: dict, project: dict, run: dict, workdir: Path,
-              diff_files: list, sl: StepLog) -> bool:
-    """执行一个 kind:gate 步骤。返回 True 表示已阻断（run 已收尾，调用方直接 return）。"""
+              diff_files: list, sl: StepLog) -> tuple[bool, str, str]:
+    """返回 (是否阻断, 状态, 完整门禁输出)，供下一节点读取。"""
     name = step.get("name") or f"门禁:{step.get('gate', 'tests')}"
     gtype = step.get("gate") or "tests"
     t0 = sl.start(name)
@@ -391,13 +436,13 @@ def _run_gate(step: dict, project: dict, run: dict, workdir: Path,
     except Exception as e:
         sl.finish(t0, "fail", str(e))
         _block_by_gate(project, run, name, gtype, "门禁执行器异常（fail loud）", str(e)[-2000:])
-        return True
+        return True, "fail", str(e)
     sl.finish(t0, gr["status"], gr.get("log", ""))
     if gr["status"] != "fail":
-        return False
+        return False, gr["status"], gr.get("log", "")
     _block_by_gate(project, run, name, gtype,
                    gr.get("cmd") or "门禁失败", gr.get("log", ""))
-    return True
+    return True, "fail", gr.get("log", "")
 
 
 def _block_by_gate(project: dict, run: dict, name: str, gtype: str,
