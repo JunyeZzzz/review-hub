@@ -710,7 +710,7 @@ function qualityNext(d) {
     href: d.marks.pending[0] ? `#/runs/${d.marks.pending[0].run_id}` : "#/runs",
     action: "打开待处理报告",
   };
-  const failedReview = d.runs.find((r) => r.status === "failed" && ageDays(r.created_at) <= 7);
+  const failedReview = d.failures[0];
   if (failedReview) return { tone: "attention", label: "排查审查执行失败",
     title: "最近有审查没有完成", text: "打开报告查看失败步骤；确认原因后再决定是否重新审查。",
     href: `#/runs/${failedReview.id}`, action: "查看失败报告" };
@@ -758,7 +758,7 @@ function qualityAttentionHtml(d) {
     grouped.get(item.run_id).count++;
   }
   const pending = [...grouped.values()].slice(0, 4);
-  const failed = d.runs.filter((r) => r.status === "failed" && ageDays(r.created_at) <= 7).slice(0, 2);
+  const failed = d.failures.slice(0, 3);
   if (!pending.length && !failed.length) return '<div class="qa-empty">暂无需要处理的报告。新的 Important 或执行失败会出现在这里。</div>';
   return `${pending.map((r) => `<div class="qa-task-row">
       <span class="qa-task-dot alert"></span><div class="qa-task-main"><strong>${esc(r.project)} · run #${r.run_id}</strong>
@@ -766,14 +766,22 @@ function qualityAttentionHtml(d) {
       <a href="#/runs/${r.run_id}">打开报告 →</a></div>`).join("")}
     ${failed.map((r) => `<div class="qa-task-row"><span class="qa-task-dot"></span>
       <div class="qa-task-main"><strong>${esc(r.project)} · run #${r.id}</strong><span>审查执行失败 · ${fmtAgo(r.created_at)}</span></div>
-      <a href="#/runs/${r.id}">查看原因 →</a></div>`).join("")}`;
+      <a href="#/runs/${r.id}">查看原因 →</a><button class="ghost small-btn" data-failure-handle="${r.id}">标记已处理</button></div>`).join("")}`;
 }
 function qualityEvalHtml(d) {
   const h = qualityLatest(d), cases = d.eval.cases, positives = cases.filter((c) => c.polarity === "positive").length;
   const changed = qualityNeedsRerun(d);
+  const done = h?.results?.length || 0;
   return `<div class="qa-eval-top"><span class="qa-status ${h?.status === "failed" || (h?.miss || 0) + (h?.fp || 0) + (h?.error || 0) ? "warn" : ""}">${qualityResultLabel(h)}</span>
     <span class="muted small">${h ? "上次 " + fmtTime(h.created_at) : "还没有基线"}</span></div>
+    <div class="qa-eval-flow"><div><b>① 固定样本</b><span>取人工判定时的提交</span></div>
+      <div><b>② 用当前配置复审</b><span>门禁、上下文、独立评审</span></div>
+      <div><b>③ 对照人工答案</b><span>查漏报与误报重现</span></div></div>
     <p>${cases.length} 条回归样本：${positives} 条应报出，${cases.length - positives} 条不应再报出。</p>
+    ${h?.status === "running" ? `<div class="qa-eval-live"><div class="qa-eval-live-head"><strong>已完成 ${done} / ${h.cases_total}</strong><span>${esc(h.current_detail || "准备下一条样本")}</span></div>
+      <div class="qa-progress"><i style="width:${Math.round(done / Math.max(h.cases_total, 1) * 100)}%"></i></div>
+      <small>当前：${esc(h.current_stage || "等待开始")}</small></div>` : ""}
+    ${h?.status === "failed" && h.error_msg ? `<div class="qa-eval-note">评测中断：${esc(h.error_msg)}。已完成样本仍可在逐项结果中查看。</div>` : ""}
     ${cases.length && !positives ? '<div class="qa-eval-note">目前只有负例，还不能检验真实问题是否漏报。</div>' : ""}
     ${h ? `<div class="qa-eval-counts"><span>漏报 <b>${h.miss || 0}</b></span><span>误报重现 <b>${h.fp || 0}</b></span><span>执行错误 <b>${h.error || 0}</b></span></div>` : ""}
     ${changed ? '<div class="qa-eval-note">流水线、提示词、规则或样本数量已变化，建议重新运行评测。</div>' : ""}
@@ -785,8 +793,10 @@ function qualityEvalHtml(d) {
 function qualityDetailsHtml(d) {
   const h = qualityLatest(d), cases = d.eval.cases;
   return `<div class="qa-details-head"><div><h3>回归样本与结果</h3>
-      <p>正例要继续报出；负例不应再出现。删除样本只影响之后的评测。</p></div>
+      <p>在原提交上用当前编排重新审查；同文件、相差不超过 15 行且标题相似，算重现。正例要报出，负例不能报出。删除样本只影响之后的评测。</p></div>
       <button class="ghost small-btn" data-qa-toggle="qa-details" aria-expanded="true">收起</button></div>
+    ${h?.status === "running" ? `<div class="qa-current-trace"><strong>当前样本：${esc(h.current_detail || "准备中")}</strong><span>${esc(h.current_stage || "等待开始")}</span>
+      <div>${(h.current_trace || []).map((s) => `<span class="qa-trace-step ${s.status}">${s.status === "ok" ? "✓" : s.status === "fail" ? "✕" : "◐"} ${esc(s.name)}</span>`).join("")}</div></div>` : ""}
     <div class="qa-detail-grid"><div><h4>保存的样本</h4>
       ${cases.length ? cases.map((c) => `<div class="qa-case-row">
         <span class="badge ${c.polarity === "positive" ? "confirmed" : "fp"}">${c.polarity === "positive" ? "应报出" : "不应再报"}</span>
@@ -794,9 +804,11 @@ function qualityDetailsHtml(d) {
           : `<span title="${esc(c.expected)}">${esc(c.expected)}</span>`}
         <button class="danger-ghost small-btn" data-eval-del="${c.id}">删除</button></div>`).join("") : '<div class="qa-empty">还没有样本。先在报告页判定 Important，再保存为样本。</div>'}</div>
       <div><h4>最近一轮逐项结果</h4>
-      ${h?.results?.length ? h.results.map((r) => `<div class="qa-case-row">
-        <span class="badge ${r.result === "hit" ? "confirmed" : "imp"}">${r.result === "hit" ? "符合预期" : RESULT_LABEL[r.result] || esc(r.result)}</span>
-        <span title="${esc(r.expected)}">${esc(r.expected)}</span></div>`).join("")
+      ${h?.results?.length ? h.results.map((r) => `<details class="qa-result-row"><summary><span class="badge ${r.result === "hit" ? "confirmed" : "imp"}">${r.result === "hit" ? "符合预期" : RESULT_LABEL[r.result] || esc(r.result)}</span>
+        <strong title="${esc(r.expected)}">${esc(r.expected)}</strong><span class="muted small">${r.polarity === "positive" ? "应报出" : "不应再报"} · ${esc(r.sha || "")}</span></summary>
+        <div class="qa-result-detail"><p>${esc(r.detail || "")}</p>
+          <div class="qa-trace">${(r.steps || []).map((s) => `<span class="qa-trace-step ${s.status}">${s.status === "ok" ? "✓" : "✕"} ${esc(s.name)}</span>`).join("") || '<span class="muted small">旧评测未记录执行步骤</span>'}</div>
+          <small>本轮实际发现：${r.actual?.length ? r.actual.map((a) => `${esc(a.file || "?")}:${esc(a.line ?? "?")} ${esc(a.title || "")}`).join("；") : "无"}</small></div></details>`).join("")
         : '<div class="qa-empty">运行评测后可在这里看每条样本的结果。</div>'}</div></div>`;
 }
 function qualityTrendHtml(d) {
@@ -867,12 +879,12 @@ async function renderWorkbench() {
   setTitle("质量工作台");
   showSkeleton();
   try {
-    const [projects, runs, marks, evaluation, metrics] = await Promise.all([
-      api("/api/projects"), api("/api/runs?limit=40"), api("/api/marks"),
+    const [projects, runs, failures, marks, evaluation, metrics] = await Promise.all([
+      api("/api/projects"), api("/api/runs?limit=40"), api("/api/runs?status=failed&unhandled=true&limit=40"), api("/api/marks"),
       api("/api/eval/last"), api("/api/metrics"),
     ]);
     if (location.hash !== "#/workbench") return;
-    qualityData = { projects, runs, marks, eval: evaluation, metrics };
+    qualityData = { projects, runs, failures, marks, eval: evaluation, metrics };
     $app.innerHTML = qualityWorkbenchHtml(qualityData);
     bindQualityActions();
     if (evaluation.history?.[0]?.status === "running") pollEval();
@@ -901,6 +913,8 @@ function bindQualityActions() {
       toast("样本已删除"); renderWorkbench();
     } catch (e) { toast(e.message, true); }
   });
+  document.querySelectorAll("[data-failure-handle]").forEach((b) => b.onclick = () =>
+    triageFailure(+b.dataset.failureHandle, "handled", renderWorkbench));
 }
 
 async function renderMarks() {
@@ -1418,10 +1432,29 @@ function runBannerHtml(run) {
   return {
     passed: `<div class="banner passed"><span class="mark"></span><div><b>通过</b> —— 未发现会导致线上问题的事项</div></div>`,
     blocked: `<div class="banner blocked"><span class="mark"></span><div><b>发现问题</b> —— ${run.important_count} 个 Important；${run.revert_pr_url ? `已自动创建回滚 PR：<a href="${esc(run.revert_pr_url)}" target="_blank">${esc(run.revert_pr_url)}</a>` : "处理完再合入，或对本 run 执行回滚"}</div></div>`,
-    failed: `<div class="banner failed"><span class="mark"></span><div><b>执行失败</b> —— ${esc(run.error || "未知错误")}（fail loud：引擎异常绝不静默放行）</div></div>`,
+    failed: `<div class="banner failed"><span class="mark"></span><div><b>执行失败</b> —— ${esc(run.error || "未知错误")}（引擎异常不会判定通过）
+      <div class="failure-triage-state">${run.failure_action === "handled" ? `✓ 已标记处理 · ${fmtTime(run.failure_at)}${run.failure_note ? ` · ${esc(run.failure_note)}` : ""}`
+        : "仍在工作台待处理；标记处理只移出待办，不会把这次审查改为通过。"}</div>
+      ${(run.failure_history || []).length ? `<details class="failure-history"><summary>查看处置记录</summary>${run.failure_history.map((e) =>
+        `<div>${fmtTime(e.created_at)} · ${e.action === "handled" ? "标记已处理" : "重新列为待处理"}${e.note ? ` · ${esc(e.note)}` : ""}</div>`).join("")}</details>` : ""}</div></div>`,
     running: `<div class="banner running"><span class="mark"></span><div><b>审查进行中</b>… 只刷新变化的步骤，页面不再整页重载</div></div>`,
     queued: `<div class="banner running"><span class="mark"></span><div><b>排队中</b>…</div></div>`,
   }[run.status] || "";
+}
+
+async function triageFailure(runId, action, onDone) {
+  let note = "";
+  if (action === "handled") {
+    note = await uiPrompt("标记失败审查已处理", {
+      message: "可选填处理说明。此操作仅从工作台移除待办；审查仍保留“执行失败”，不会变为通过。",
+    });
+    if (note === null) return;
+  } else if (!await uiConfirm("重新放回工作台待处理？审查仍保留“执行失败”。")) return;
+  try {
+    await api(`/api/runs/${runId}/failure-triage`, {method: "POST", body: {action, note}});
+    toast(action === "handled" ? "已从工作台待办移除；失败记录仍保留" : "已重新列入待处理");
+    onDone?.();
+  } catch (e) { toast(e.message, true); }
 }
 
 function runKvHtml(run) {
@@ -1572,14 +1605,15 @@ function patchRunDynamic(prev, fresh) {
   // banner
   const $b = $("banner-box");
   if ($b && (pv.status !== fresh.status || pv.revert_pr_url !== fresh.revert_pr_url
-      || pv.important_count !== fresh.important_count)) {
+      || pv.important_count !== fresh.important_count || pv.failure_action !== fresh.failure_action)) {
     $b.innerHTML = runBannerHtml(fresh);
   }
   // 头部操作区（回滚按钮随状态出现/消失）
   const $a = $("run-actions");
   if ($a) {
     const html = `${fresh.status === "blocked" && fresh.head_sha && fresh.project_kind === "github" && !fresh.revert_pr_url
-      ? `<button id="revert-btn">创建回滚 PR</button>` : ""}`;
+      ? `<button id="revert-btn">创建回滚 PR</button>` : ""}
+      ${fresh.status === "failed" ? `<button id="failure-triage-btn" class="${fresh.failure_action === "handled" ? "ghost" : "primary"}">${fresh.failure_action === "handled" ? "重新列为待处理" : "标记已处理"}</button>` : ""}`;
     if ($a.innerHTML !== html) {
       $a.innerHTML = html;
       const revertBtn = $("revert-btn");
@@ -1591,6 +1625,9 @@ function patchRunDynamic(prev, fresh) {
           renderRun(fresh.id, true);
         } catch (e) { toast(e.message, true); }
       };
+      const triageBtn = $("failure-triage-btn");
+      if (triageBtn) triageBtn.onclick = () => triageFailure(fresh.id,
+        fresh.failure_action === "handled" ? "reopen" : "handled", () => renderRun(fresh.id, true));
     }
   }
   // 本次流水线快照

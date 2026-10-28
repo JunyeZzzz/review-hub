@@ -44,6 +44,7 @@ def startup() -> None:
     if config.PUBLIC_BASE_URL and not config.PUBLIC_BASE_URL.startswith("https://"):
         raise RuntimeError("公网 PUBLIC_BASE_URL 必须使用 HTTPS")
     db.init()
+    evaluator.recover_interrupted()
     connections.scrub_clone_remotes()
     worker.start_background()
 
@@ -577,6 +578,7 @@ def reinit_project(pid: int):
 @app.delete("/api/projects/{pid}")
 def delete_project(pid: int):
     db.execute("DELETE FROM finding_marks WHERE run_id IN (SELECT id FROM runs WHERE project_id=?)", (pid,))
+    db.execute("DELETE FROM run_failure_events WHERE run_id IN (SELECT id FROM runs WHERE project_id=?)", (pid,))
     db.execute("DELETE FROM runs WHERE project_id=?", (pid,))
     db.execute("DELETE FROM projects WHERE id=?", (pid,))
     return {"ok": True}
@@ -736,7 +738,7 @@ def metrics():
 @app.get("/api/runs")
 def list_runs(project_id: int | None = None, limit: int = 50,
               status: str = "", trigger: str = "", reverted: bool = False,
-              since: str = ""):
+              since: str = "", unhandled: bool = False):
     """审查列表，支持指标页/总览下钻：状态 / 触发方式 / 仅回滚 / 起始日期(YYYY-MM-DD)。"""
     conds, args = [], []
     if project_id:
@@ -753,9 +755,16 @@ def list_runs(project_id: int | None = None, limit: int = 50,
     if since:
         conds.append("r.created_at >= ?")
         args.append(since)
+    if unhandled:
+        conds.append("r.status='failed' AND COALESCE((SELECT e.action FROM run_failure_events e "
+                     "WHERE e.run_id=r.id ORDER BY e.id DESC LIMIT 1),'') <> 'handled'")
     w = (" WHERE " + " AND ".join(conds)) if conds else ""
     rows = db.query(
-        "SELECT r.*, p.name AS project FROM runs r JOIN projects p ON p.id=r.project_id" + w +
+        "SELECT r.*, p.name AS project, "
+        "(SELECT e.action FROM run_failure_events e WHERE e.run_id=r.id ORDER BY e.id DESC LIMIT 1) AS failure_action, "
+        "(SELECT e.note FROM run_failure_events e WHERE e.run_id=r.id ORDER BY e.id DESC LIMIT 1) AS failure_note, "
+        "(SELECT e.created_at FROM run_failure_events e WHERE e.run_id=r.id ORDER BY e.id DESC LIMIT 1) AS failure_at "
+        "FROM runs r JOIN projects p ON p.id=r.project_id" + w +
         " ORDER BY r.id DESC LIMIT ?", (*args, min(limit, 200)))
     return [dict(r) for r in rows]
 
@@ -772,11 +781,40 @@ def get_run(run_id: int):
     d["findings"] = json.loads(run["findings_json"]) if run["findings_json"] else []
     d["has_diff"] = bool(run["diff_text"])
     d.pop("diff_text", None)   # 完整 diff 走独立端点，避免轮询背负 200KB
+    failure_events = [dict(e) for e in db.query(
+        "SELECT action,note,created_at FROM run_failure_events WHERE run_id=? ORDER BY id DESC", (run_id,))]
+    d["failure_history"] = failure_events
+    d["failure_action"] = failure_events[0]["action"] if failure_events else ""
+    d["failure_note"] = failure_events[0]["note"] if failure_events else ""
+    d["failure_at"] = failure_events[0]["created_at"] if failure_events else None
     marks = {r["idx"]: r["disposition"] for r in
              db.query("SELECT idx, disposition FROM finding_marks WHERE run_id=?", (run_id,))}
     for i, f in enumerate(d["findings"]):
         f["disposition"] = marks.get(i, "")
     return d
+
+
+class FailureTriageIn(BaseModel):
+    action: str
+    note: str = ""
+
+
+@app.post("/api/runs/{run_id}/failure-triage")
+def triage_failed_run(run_id: int, body: FailureTriageIn):
+    run = db.get("SELECT id,status FROM runs WHERE id=?", (run_id,))
+    if not run:
+        raise HTTPException(404, "审查不存在")
+    if run["status"] != "failed":
+        raise HTTPException(409, "只有执行失败的审查可以标记处理状态")
+    if body.action not in ("handled", "reopen"):
+        raise HTTPException(400, "action 只能是 handled 或 reopen")
+    note = body.note.strip()[:500]
+    latest = db.get("SELECT action,note FROM run_failure_events WHERE run_id=? ORDER BY id DESC LIMIT 1", (run_id,))
+    if latest and latest["action"] == body.action and latest["note"] == note:
+        return {"ok": True, "action": body.action, "unchanged": True}
+    db.execute("INSERT INTO run_failure_events(run_id,action,note,created_at) VALUES(?,?,?,?)",
+               (run_id, body.action, note, db.now()))
+    return {"ok": True, "action": body.action, "unchanged": False}
 
 
 @app.get("/api/runs/{run_id}/diff")
@@ -891,11 +929,19 @@ def eval_last():
             res = json.loads(r["results"]) if r["results"] else []
         except Exception:
             res = []
+        try:
+            live_trace = json.loads(r["current_trace"] or "[]")
+        except Exception:
+            live_trace = []
         history.append({
             "id": r["id"], "created_at": r["created_at"], "status": r["status"],
             "cases_total": r["cases_total"], "hit": r["hit"], "miss": r["miss"],
             "fp": r["fp"], "error": r["error"], "config": cfg, "results": res,
             "error_msg": r["error_msg"],
+            "current_case_id": r["current_case_id"],
+            "current_stage": r["current_stage"],
+            "current_detail": r["current_detail"],
+            "current_trace": live_trace,
         })
     return {"cases": cases, "history": history,
             "current_config": json.loads(evaluator._config_snapshot())}

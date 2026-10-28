@@ -61,15 +61,26 @@ def start_eval() -> dict:
     return {"ok": True, "eval_id": rid}
 
 
+def recover_interrupted() -> None:
+    """进程重启后，旧线程不可能恢复；保留最后进度并标为失败。"""
+    db.execute("UPDATE eval_runs SET status='failed',error_msg=?,finished_at=? WHERE status='running'",
+               ("服务重启中断了评测；已完成样本仍可查看，请重新运行", db.now()))
+
+
 def _run_eval(rid: int, cases: list) -> None:
     counters = {"hit": 0, "miss": 0, "fp": 0, "error": 0}
     results = []
     try:
         for c in cases:
-            r = _run_case(c)
+            def publish(stage: str, trace: list[dict]) -> None:
+                db.execute("UPDATE eval_runs SET current_case_id=?,current_stage=?,current_detail=?,current_trace=? WHERE id=?",
+                           (c["id"], stage, json.loads(c["expected"]).get("title", ""),
+                            json.dumps(trace, ensure_ascii=False), rid))
+            r = _run_case(c, publish)
             counters[r["result"]] += 1
             results.append(r)
-            db.execute("UPDATE eval_runs SET hit=?, miss=?, fp=?, error=?, results=? WHERE id=?",
+            db.execute("UPDATE eval_runs SET hit=?, miss=?, fp=?, error=?, results=?,"
+                       "current_case_id=NULL,current_stage=NULL,current_detail=NULL,current_trace=NULL WHERE id=?",
                        (counters["hit"], counters["miss"], counters["fp"], counters["error"],
                         json.dumps(results, ensure_ascii=False), rid))
         db.execute("UPDATE eval_runs SET status='done', finished_at=? WHERE id=?", (db.now(), rid))
@@ -80,20 +91,31 @@ def _run_eval(rid: int, cases: list) -> None:
         _eval_lock.release()
 
 
-def _run_case(case: dict) -> dict:
+def _run_case(case: dict, progress=None) -> dict:
     base = {"case_id": case["id"], "repo": "", "sha": case["head_sha"][:8],
             "polarity": case["polarity"], "expected": json.loads(case["expected"]).get("title", "")}
+    trace = []
+    def stage(name: str) -> None:
+        if trace and trace[-1]["status"] == "running":
+            trace[-1]["status"] = "ok"
+        trace.append({"name": name, "status": "running"})
+        if progress:
+            progress(name, trace)
     project = db.get("SELECT * FROM projects WHERE id=?", (case["project_id"],))
     if not project or project["kind"] != "github":
-        return {**base, "result": "error", "detail": "用例所属项目不是 GitHub 项目（MVP 只支持 GitHub）"}
+        return {**base, "result": "error", "detail": "用例所属项目不是 GitHub 项目（MVP 只支持 GitHub）",
+                "steps": [{"name": "验证项目", "status": "fail"}]}
     base["repo"] = project["full_name"]
     try:
         # 评测使用独立目录，避免 checkout/clean 覆盖正在执行的审查。
+        stage("拉取仓库代码")
         parent = Path(tempfile.mkdtemp(prefix=f"hub-eval-{case['id']}-", dir=config.DATA_DIR))
         workdir = parent / "repo"
         worker._ensure_clone(project, workdir)
+        stage("检出原提交")
         worker._git_retry(workdir, "checkout", "--detach", "-f", case["head_sha"])
         worker._git_retry(workdir, "clean", "-fd")
+        stage("生成审查输入")
         built = prompts.build(workdir, intent=case["intent"] or "", profile=project["profile"] or "")
         diff_text = built["diff_file"].read_text(encoding="utf-8")
         outs = []
@@ -103,6 +125,7 @@ def _run_case(case: dict) -> dict:
             if not step.get("enabled", True):
                 continue
             if step.get("kind") == "gate":
+                stage("门禁 · " + (step.get("name") or step.get("gate", "测试")))
                 kw = {"cfg": step, "cache_id": f"eval-{case['id']}"}
                 gtype = step.get("gate", "tests")
                 if gtype == "semgrep":
@@ -118,28 +141,42 @@ def _run_case(case: dict) -> dict:
                 for member in step.get("reviewers", []):
                     if not member.get("enabled", True):
                         continue
+                    stage("独立评审 · " + (member.get("name") or member.get("id", "评审")))
                     text, _, _ = worker._run_reviewer_step(member, project, workdir, built, diff_text, prior)
                     name = member.get("name") or member.get("id", "评审")
                     if verdict.extract_findings(text) is None:
                         raise RuntimeError(f"{name} 未返回有效 findings JSON")
                     outs.append((name, text))
                 continue
+            stage("上游上下文 · " + (step.get("name") or step.get("id", "分析")))
             text, _, _ = worker._run_reviewer_step(step, project, workdir, built, diff_text, prior)
             name = step.get("name") or step.get("id", "评审")
             prior.append({"name": name, "status": "ok", "output": text})
+        stage("合并评审发现")
         merged = verdict.merge_multi(outs)
+        stage("与人工答案比对")
     except Exception as e:
-        return {**base, "result": "error", "detail": str(e)[-300:]}
+        if trace:
+            trace[-1]["status"] = "fail"
+        return {**base, "result": "error", "detail": str(e)[-300:], "steps": trace}
     finally:
         if "parent" in locals():
             shutil.rmtree(parent, ignore_errors=True)
-    expected = json.loads(case["expected"])
-    got_list = [f for f in merged["findings"] if verdict.similar(f, expected)]
-    actual = [{"severity": f.get("severity"), "file": f.get("file"),
-               "line": f.get("line"), "title": f.get("title")}
-              for f in merged["findings"][:8]]
+    try:
+        expected = json.loads(case["expected"])
+        got_list = [f for f in merged["findings"] if verdict.similar(f, expected)]
+        actual = [{"severity": f.get("severity"), "file": f.get("file"),
+                   "line": f.get("line"), "title": f.get("title")}
+                  for f in merged["findings"][:8]]
+    except Exception as e:
+        trace[-1]["status"] = "fail"
+        return {**base, "result": "error", "detail": f"人工答案比对失败：{e}"[-300:], "steps": trace}
     if case["polarity"] == "positive":
+        trace[-1]["status"] = "ok"
         return {**base, "result": "hit" if got_list else "miss",
-                "detail": f"共报 {len(merged['findings'])} 条", "actual": actual}
+                "detail": f"共报 {len(merged['findings'])} 条；匹配预期 {len(got_list)} 条",
+                "actual": actual, "steps": trace}
+    trace[-1]["status"] = "ok"
     return {**base, "result": "hit" if not got_list else "fp",
-            "detail": "负例通过" if not got_list else "误报重现", "actual": actual}
+            "detail": "负例通过：未重现相似发现" if not got_list else "误报重现：出现相似发现",
+            "actual": actual, "steps": trace}

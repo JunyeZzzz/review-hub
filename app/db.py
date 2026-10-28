@@ -84,6 +84,14 @@ CREATE TABLE IF NOT EXISTS finding_marks (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (run_id, idx)
 );
+CREATE TABLE IF NOT EXISTS run_failure_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL,
+  action TEXT NOT NULL CHECK(action IN ('handled','reopen')),
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_run_failure_events_run ON run_failure_events(run_id,id);
 CREATE TABLE IF NOT EXISTS eval_cases (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id INTEGER NOT NULL,
@@ -112,6 +120,10 @@ CREATE TABLE IF NOT EXISTS eval_runs (
   config_snapshot TEXT,
   results TEXT,
   error_msg TEXT,
+  current_case_id INTEGER,
+  current_stage TEXT,
+  current_detail TEXT,
+  current_trace TEXT,
   created_at TEXT NOT NULL, finished_at TEXT
 );
 """
@@ -141,6 +153,11 @@ def conn() -> sqlite3.Connection:
 def init() -> None:
     c = conn()
     c.executescript(SCHEMA)
+    eval_cols = {r[1] for r in c.execute("PRAGMA table_info(eval_runs)")}
+    for col, definition in (("current_case_id", "INTEGER"), ("current_stage", "TEXT"),
+                            ("current_detail", "TEXT"), ("current_trace", "TEXT")):
+        if col not in eval_cols:
+            c.execute(f"ALTER TABLE eval_runs ADD COLUMN {col} {definition}")
     # 轻量迁移：补列（存在则跳过）
     existing = {r[1] for r in c.execute("PRAGMA table_info(runs)")}
     for col in ("branch", "commit_msg", "commit_author", "commit_date", "intent",
