@@ -336,7 +336,7 @@ def _diff_range(workdir: Path, run: dict, project: dict) -> tuple[str, str]:
     if run["trigger"] == "pr" and run["head_sha"]:
         return run["base_ref"] or f"origin/{project['default_branch']}", run["head_sha"]
     head = run["head_sha"] or "HEAD"
-    if run["trigger"] == "push" and run["base_ref"]:
+    if run["trigger"] in ("push", "manual") and run["base_ref"]:
         return run["base_ref"], head
     parents = _git(workdir, "rev-list", "--parents", "-n", "1", head).stdout.split()
     if len(parents) == 1:
@@ -351,9 +351,17 @@ MAX_INTENT_CHARS = 60_000
 
 
 def _intent_for_range(workdir: Path, run: dict, diff_spec: str, fallback: str) -> str:
-    """累计 push 的审查意图来自整段提交，不能只取最后一个 commit message。"""
-    if run["trigger"] != "push" or not run["base_ref"]:
+    """累计区间用整段提交说明；手动树基线以完整代码审查为目标。"""
+    if run["trigger"] not in ("push", "manual") or not run["base_ref"]:
         return fallback
+    if run["trigger"] == "manual":
+        base_type = _git(workdir, "cat-file", "-t", run["base_ref"]).stdout.strip()
+        if base_type == "tree":
+            return ("手动指定代码树基线审查：目标是检查该基线到当前提交的完整代码差异，"
+                    "找出可验证的真实缺陷。最新提交说明只对应最后一次提交，"
+                    "不能代表这次完整审查的变更目的。")
+        if base_type != "commit":
+            raise RuntimeError(f"手动审查基线必须是提交或代码树，实际为 {base_type}")
     history = _git(workdir, "log", "--reverse", "--format=%h %s%n%b%x00", diff_spec).stdout
     messages = [item.strip() for item in history.split("\x00") if item.strip()]
     if not messages:

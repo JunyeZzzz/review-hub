@@ -109,10 +109,25 @@ class DefaultBranchWorkflowTest(unittest.TestCase):
         self.assertIn("second", intent)
         self.assertIn("third", intent)
         self.assertLess(intent.index("second"), intent.index("third"))
+        manual_base, manual_head = worker._diff_range(
+            repo, {"trigger": "manual", "base_ref": before, "head_sha": after}, {})
+        self.assertEqual((manual_base, manual_head), (before, after))
+        manual_diff = prompts.build(repo, diff_spec=f"{manual_base}..{manual_head}")["diff_file"].read_text()
+        self.assertIn("second.txt", manual_diff)
+        self.assertIn("third.txt", manual_diff)
+        manual_intent = worker._intent_for_range(
+            repo, {"trigger": "manual", "base_ref": before}, f"{before}..{after}", "third")
+        self.assertIn("second", manual_intent)
+        self.assertIn("third", manual_intent)
         root_base, root_head = worker._diff_range(
             repo, {"trigger": "push", "base_ref": "", "head_sha": before}, {})
         root_diff = prompts.build(repo, diff_spec=f"{root_base}..{root_head}")["diff_file"].read_text()
         self.assertIn("first.txt", root_diff)
+        tree_intent = worker._intent_for_range(
+            repo, {"trigger": "manual", "base_ref": root_base},
+            f"{root_base}..{after}", "third")
+        self.assertIn("完整代码差异", tree_intent)
+        self.assertNotIn("third", tree_intent)
 
     def test_large_git_diff_keeps_last_line_and_creates_review_parts(self):
         repo = self.root / "large-repo"
