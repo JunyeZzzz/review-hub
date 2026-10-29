@@ -45,7 +45,7 @@ def _git(workdir: Path, *args: str, check=True):
 # ---------- 流水线编排：配置中心可读可写，worker 按它执行 ----------
 
 DEFAULT_GATE = {"id": "gate-test", "kind": "gate", "name": "测试门禁", "gate": "tests",
-                "sandbox": "docker", "enabled": True}
+                "sandbox": "off", "enabled": True}
 
 DEFAULT_PIPELINE = [
     dict(DEFAULT_GATE),

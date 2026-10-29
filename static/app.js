@@ -2534,7 +2534,7 @@ const PLACEHOLDERS = [
 
 const GATE_LABEL = { tests: "测试", build: "构建", semgrep: "安全扫描" };
 const GATE_TIP = "机械门禁：失败即红灯阻断，不调用模型；仅仓库没有对应入口才跳过。执行工具缺失或安全扫描未完成都记失败";
-const SANDBOX_TIP = "推荐 Docker 沙盒：一次性容器、资源限制和依赖缓存。本机模式会运行仓库代码，可能读取服务器文件，只允许可信仓库且需服务器显式设置 HUB_ALLOW_HOST_GATES=1；仅清理环境变量无法隔离文件。Docker 不可用会阻断门禁";
+const SANDBOX_TIP = "默认本机执行：不同项目使用各自的仓库目录，每条门禁命令使用独立 HOME、临时目录和工具缓存；超时清理该命令进程组。本机代码仍可读取服务账户有权读取的文件，请只接入可信仓库。旧配置可继续使用 Docker";
 
 let nodeCredentials = [];
 const NODE_KIND = { gate: "门禁", reviewer: "Agent", api: "模型 API", review: "交叉评审" };
@@ -2542,7 +2542,7 @@ const NODE_PURPOSE = { findings: "独立评审", context: "提供上游上下文
 function newPipeNode(kind, index) {
   const base = { id: `node-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     kind, name: `${NODE_KIND[kind]}节点 ${index}`, enabled: true };
-  if (kind === "gate") return { ...base, gate: "tests", sandbox: "docker", network: "install", image: "" };
+  if (kind === "gate") return { ...base, gate: "tests", sandbox: "off", network: "install", image: "" };
   if (kind === "api") return { ...base, credential_id: nodeCredentials.find((c) => !c.disabled)?.id || null,
     model: "", purpose: "context", prompt: "" };
   return { ...base, provider: "claude", model: "", purpose: "context", prompt: "" };
@@ -2567,7 +2567,7 @@ function pipeListHTML(draft) {
               <button class="danger-ghost small-btn" data-member-del="${j}">删除</button></div></div>`;
         }).join("")}</div></div></div>`;
       const cred = nodeCredentials.find((c) => c.id === s.credential_id);
-      const detail = s.kind === "gate" ? `${GATE_LABEL[s.gate] || s.gate} · ${s.sandbox === "docker" ? "Docker 沙盒" : "本机隔离"}`
+      const detail = s.kind === "gate" ? `${GATE_LABEL[s.gate] || s.gate} · ${s.sandbox === "docker" ? "Docker 沙盒" : "本机独立环境"}`
         : s.kind === "api" ? `${cred ? esc(cred.label) : "未绑定凭证"} · ${esc(s.model || "未填模型")}`
         : `${s.provider === "codex" ? "Kimi / Codex" : "Claude Code"} · ${esc(s.model || "默认模型")}`;
       return `<div class="node-flow-item"><div class="pipe-step ${s.enabled ? "" : "off"}" data-idx="${i}">
@@ -2598,9 +2598,12 @@ function openNodeEditor(draft, index, repaint, onCancel = null) {
   let specific = "";
   if (s.kind === "gate") {
     specific = nodeChoiceField("门禁任务", "gate", Object.entries(GATE_LABEL), s.gate, GATE_TIP)
-      + nodeChoiceField("执行环境", "sandbox", [["off", "本机隔离"], ["docker", "Docker 沙盒"]], s.sandbox || "off", SANDBOX_TIP)
+      + (s.sandbox === "docker"
+        ? nodeChoiceField("执行环境", "sandbox", [["off", "本机独立环境"], ["docker", "Docker（旧配置）"]], "docker", SANDBOX_TIP)
+        : nodeField("执行环境", '<div class="muted">本机独立环境</div><input type="hidden" name="sandbox" value="off">', SANDBOX_TIP))
+      + `<div data-docker-options ${s.sandbox === "docker" ? "" : "hidden"}>`
       + nodeChoiceField("Docker 网络", "network", [["install", "仅安装依赖时联网"], ["off", "完全断网"], ["on", "全程联网"]], s.network || "install")
-      + nodeField("Docker 镜像", `<input name="image" value="${esc(s.image || "")}" maxlength="80" placeholder="留空按仓库自动选择">`);
+      + nodeField("Docker 镜像", `<input name="image" value="${esc(s.image || "")}" maxlength="80" placeholder="留空按仓库自动选择">`) + `</div>`;
   } else {
     specific = (s.kind === "api"
         ? nodeChoiceField("模型凭证", "credential_id", nodeCredentials.filter((c) => !c.disabled).map((c) => [c.id, `${c.label} · ${c.provider}`]), s.credential_id,
@@ -2614,6 +2617,9 @@ function openNodeEditor(draft, index, repaint, onCancel = null) {
       ${common}${specific}<div class="rh-dialog-actions"><button type="button" class="ghost" data-close>取消</button>
       <button type="submit" class="primary">应用到草稿</button></div></form>`;
   document.body.appendChild(dialog);
+  if (s.kind === "gate") dialog.querySelectorAll('input[name="sandbox"]').forEach((radio) => {
+    radio.onchange = () => { dialog.querySelector("[data-docker-options]").hidden = radio.value !== "docker"; };
+  });
   const close = (cancelled = false) => { dialog.close(); dialog.remove(); if (cancelled) onCancel?.(); };
   dialog.querySelectorAll("[data-close]").forEach((b) => b.onclick = () => close(true));
   dialog.addEventListener("cancel", (e) => { e.preventDefault(); close(true); });

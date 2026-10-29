@@ -46,7 +46,7 @@ CODEX_HOME = DATA_DIR / "codex-home"
 
 PORT = int(os.environ.get("HUB_PORT", "7777"))
 
-# 并发审查 worker 数：门禁沙盒（资源上限）就位后，多项目同时审查才安全
+# 并发审查 worker 数：不同项目工作目录分开；本机命令仍共享系统资源和用户权限。
 WORKER_CONCURRENCY = max(1, int(os.environ.get("WORKER_CONCURRENCY", "2")))
 
 # CLI 绝对路径：启动时解析一次，避免运行期 PATH 漂移导致"时有时无"

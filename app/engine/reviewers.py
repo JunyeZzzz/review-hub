@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 
 from .. import config
+from ..processes import run_grouped
 
 
 class ReviewerError(RuntimeError):
@@ -132,8 +133,8 @@ def run_claude(workdir: Path, prompt_file: Path, model: str = ""):
     model = model or config.get_claude_model()
     if model:
         cmd += ["--model", model]
-    r = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=900,
-                       env=_subprocess_env(), stdin=subprocess.DEVNULL)
+    r = run_grouped(cmd, cwd=workdir, env=_subprocess_env(), timeout=900,
+                    stdin=subprocess.DEVNULL)
     if r.returncode != 0:
         raise ReviewerError(f"claude 退出码 {r.returncode}：{(r.stderr or r.stdout)[-500:]}")
     text, trace = _parse_claude_stream(r.stdout)
@@ -156,8 +157,7 @@ def run_codex(workdir: Path, prompt_file: Path, model: str = ""):
     model = model or config.get_kimi_model()
     if model:
         cmd = cmd[:1] + ["--model", model] + cmd[1:]
-    r = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=900, env=env,
-                       stdin=subprocess.DEVNULL)
+    r = run_grouped(cmd, cwd=workdir, env=env, timeout=900, stdin=subprocess.DEVNULL)
     if r.returncode != 0:
         raise ReviewerError(f"codex 退出码 {r.returncode}：{(r.stderr or r.stdout)[-500:]}")
     text, trace = _parse_codex_stream(r.stdout)

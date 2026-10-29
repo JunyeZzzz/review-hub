@@ -2,13 +2,16 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
 from app.engine import gates
-from app import worker
+from app import config, git_auth, processes, worker
 
 
 class GateIntegrityTest(unittest.TestCase):
@@ -20,21 +23,85 @@ class GateIntegrityTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_declared_gate_fails_when_runner_is_missing(self):
-        with patch.object(gates.subprocess, "run", side_effect=FileNotFoundError()):
+        with patch.object(gates, "_run_host", side_effect=FileNotFoundError()):
             result = gates._exec(["pytest", "-q"], self.root, 1)
         self.assertEqual(result["status"], "fail")
         self.assertIn("无法执行", result["log"])
 
-    def test_host_gate_requires_explicit_trust_opt_in(self):
-        with patch.dict(os.environ, {}, clear=True), patch.object(gates, "_exec") as runner:
-            result = gates._run_sandboxed(["make", "test"], self.root, 1, {"sandbox": "off"}, "", "测试")
-        self.assertEqual(result["status"], "fail")
-        runner.assert_not_called()
-        with patch.dict(os.environ, {"HUB_ALLOW_HOST_GATES": "1"}), \
+    def test_host_gate_runs_without_docker_or_opt_in(self):
+        self.assertEqual(worker.DEFAULT_GATE["sandbox"], "off")
+        with patch.dict(os.environ, {}, clear=True), \
              patch.object(gates, "_exec", return_value={"status": "ok", "log": "ran"}) as runner:
             result = gates._run_sandboxed(["make", "test"], self.root, 1, {"sandbox": "off"}, "", "测试")
         self.assertEqual(result["status"], "ok")
         runner.assert_called_once()
+
+    def test_concurrent_git_auth_uses_complete_script_and_per_process_token(self):
+        with patch.object(config, "DATA_DIR", self.root):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                envs = list(pool.map(lambda n: git_auth.auth_env(f"token-{n}"), range(20)))
+        script = self.root / "git-askpass.sh"
+        self.assertEqual(script.read_text(), git_auth.ASKPASS_BODY)
+        self.assertEqual(script.stat().st_mode & 0o777, 0o700)
+        for n, env in enumerate(envs):
+            result = subprocess.run([str(script), "Password for github"], env=env,
+                                    capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout, f"token-{n}")
+
+    def test_concurrent_projects_have_distinct_home_tmp_and_working_dirs(self):
+        projects = [self.root / "project-a", self.root / "project-b"]
+        for project in projects:
+            project.mkdir()
+        code = ("import json, os, pathlib, tempfile, time; "
+                "pathlib.Path('environment.json').write_text(json.dumps({"
+                "'cwd': os.getcwd(), 'home': os.environ['HOME'], "
+                "'tmp': os.environ['TMPDIR'], 'cache': os.environ['XDG_CACHE_HOME']})); "
+                "time.sleep(0.2)")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda path: gates._exec([sys.executable, "-c", code], path, 5), projects))
+        self.assertEqual([r["status"] for r in results], ["ok", "ok"])
+        envs = [json.loads((path / "environment.json").read_text()) for path in projects]
+        for field in ("cwd", "home", "tmp", "cache"):
+            self.assertNotEqual(envs[0][field], envs[1][field])
+        self.assertEqual([Path(e["cwd"]).resolve() for e in envs], [p.resolve() for p in projects])
+        self.assertFalse(Path(envs[0]["home"]).exists())
+        self.assertFalse(Path(envs[1]["home"]).exists())
+
+    def test_two_projects_run_real_test_gates_in_parallel_without_docker(self):
+        projects = [self.root / "gate-a", self.root / "gate-b"]
+        for project in projects:
+            project.mkdir()
+            (project / "Makefile").write_text("test:\n\t@echo passed > result.txt\n")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(gates.run_tests, projects))
+        self.assertEqual([r["status"] for r in results], ["ok", "ok"])
+        self.assertEqual([(p / "result.txt").read_text().strip() for p in projects],
+                         ["passed", "passed"])
+
+    def test_timeout_kills_child_process_in_own_group(self):
+        marker = self.root / "escaped.txt"
+        child = f"import time,pathlib; time.sleep(0.8); pathlib.Path({str(marker)!r}).write_text('late')"
+        parent = f"import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',{child!r}]); time.sleep(5)"
+        result = gates._exec([sys.executable, "-c", parent], self.root, 0.15)
+        self.assertEqual(result["status"], "fail")
+        time.sleep(1)
+        self.assertFalse(marker.exists())
+
+    def test_gate_cannot_pass_with_detached_background_child(self):
+        marker = self.root / "background.txt"
+        child = f"import time,pathlib; time.sleep(0.8); pathlib.Path({str(marker)!r}).write_text('late')"
+        parent = f"import subprocess,sys; subprocess.Popen([sys.executable,'-c',{child!r}])"
+        result = gates._exec([sys.executable, "-c", parent], self.root, 2)
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("后台子进程", result["log"])
+        time.sleep(1)
+        self.assertFalse(marker.exists())
+
+    def test_excessive_output_fails_instead_of_using_prefix(self):
+        with self.assertRaisesRegex(processes.OutputLimitExceeded, "不能截断后判定通过"):
+            processes.run_grouped([sys.executable, "-c", "print('x' * 3000)"],
+                                  cwd=self.root, env=os.environ.copy(), timeout=5,
+                                  max_output_bytes=1000)
 
     def test_lockfile_uses_strict_npm_ci_without_fallback(self):
         (self.root / "package.json").write_text('{}')
@@ -57,11 +124,11 @@ class GateIntegrityTest(unittest.TestCase):
         for name in files:
             (self.root / name).write_text("pass\n")
         seen = []
-        def fake_run(cmd, **kwargs):
+        def fake_run(cmd, *_args):
             seen.extend(cmd[cmd.index("--") + 1:])
             return subprocess.CompletedProcess(cmd, 0, json.dumps({"results": [], "errors": []}), "")
         with patch.object(gates, "semgrep_available", return_value=True), \
-             patch.object(gates.subprocess, "run", side_effect=fake_run):
+             patch.object(gates, "_run_host", side_effect=fake_run):
             result = gates.run_semgrep(self.root, files)
         self.assertEqual(result["status"], "ok")
         self.assertEqual(seen, files)

@@ -1,9 +1,9 @@
 """机械门禁：密钥扫描 / 测试 / 构建 / semgrep 安全扫描。
 
-隔离原则（docs/GAP-ANALYSIS.md「我们的风格」）：
-- 门禁在人审之前执行未经审查的代码；主机模式必须显式开启，环境变量白名单不构成文件隔离；
-- Docker 沙盒模式：一次性容器 + 断网（依赖安装期可单独放网）+ 资源上限 + 按项目的依赖缓存卷；
-- 显式选择了 Docker / 工具而环境不满足 -> fail loud 红灯，不静默跳过。
+隔离原则：
+- 默认本机执行；每条门禁命令使用独立 HOME、临时目录和工具缓存，工作目录按项目分开；
+- 超时清理整个命令进程组；环境变量白名单只减少意外串扰，不提供文件权限隔离；
+- 旧配置仍可显式选 Docker；工具或执行环境缺失时门禁失败。
 """
 import json
 import os
@@ -11,8 +11,12 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path
+
+from .. import config
+from ..processes import BackgroundProcessLeftover, OutputLimitExceeded, run_grouped
 
 SECRET_PATTERNS = [
     ("AWS Access Key", re.compile(r"AKIA[0-9A-Z]{16}")),
@@ -29,17 +33,40 @@ MAX_SEMGREP_BATCHES = 40
 # pytest 及其依赖缺失时解释器会报 No module named XXX——这是环境问题，不是测试失败
 _MISSING_MODULE_RX = re.compile(r"No module named ['\"]?(pytest|pluggy|iniconfig|hamcrest)['\"]?")
 
-# 主机模式环境白名单：只给运行工具所需的最小集。被审代码拿不到任何凭证。
-_ENV_KEEP = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
-             "TERM", "SHELL", "USER", "LOGNAME")
+# 本机命令只继承执行所需的变量；HOME/TMPDIR 和工具缓存每条命令单独创建。
+_ENV_KEEP = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "SHELL", "USER", "LOGNAME")
 
 DOCKER_LIMITS = ["--cpus", "2", "--memory", "2g", "--pids-limit", "512", "--cap-drop", "ALL"]
 
 _NET_LABEL = {"off": "断网", "install": "仅安装期放网", "on": "全程放网"}
 
 
-def _gate_env() -> dict:
-    return {k: v for k, v in os.environ.items() if k in _ENV_KEEP}
+def _gate_env(runtime: Path, workdir: Path) -> dict:
+    env = {k: v for k, v in os.environ.items() if k in _ENV_KEEP}
+    for name in ("home", "tmp", "cache", "config", "go", "npm"):
+        (runtime / name).mkdir(mode=0o700, exist_ok=True)
+    env.update({
+        "HOME": str(runtime / "home"), "TMPDIR": str(runtime / "tmp"),
+        "TMP": str(runtime / "tmp"), "TEMP": str(runtime / "tmp"),
+        "XDG_CACHE_HOME": str(runtime / "cache"),
+        "XDG_CONFIG_HOME": str(runtime / "config"),
+        "PIP_CACHE_DIR": str(runtime / "cache" / "pip"),
+        "PIP_CONFIG_FILE": os.devnull,
+        "npm_config_cache": str(runtime / "npm"),
+        "npm_config_userconfig": str(runtime / "config" / "npmrc"),
+        "GOPATH": str(runtime / "go"),
+        "GOCACHE": str(runtime / "cache" / "go-build"),
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "PWD": str(workdir),
+    })
+    return env
+
+
+def _run_host(cmd: list, workdir: Path, timeout: int) -> subprocess.CompletedProcess:
+    """每次独立的进程环境；超时杀掉该命令的进程组，不牵连其他审查。"""
+    with tempfile.TemporaryDirectory(prefix="hub-gate-", dir=config.DATA_DIR) as tmp:
+        return run_grouped(cmd, cwd=workdir, env=_gate_env(Path(tmp), workdir), timeout=timeout,
+                           stdin=subprocess.DEVNULL)
 
 
 def scan_secrets(workdir: Path, files: list) -> dict:
@@ -76,13 +103,14 @@ def scan_secrets(workdir: Path, files: list) -> dict:
 
 def _exec(cmd: list, workdir: Path, timeout: int) -> dict:
     try:
-        r = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True,
-                           timeout=timeout, env=_gate_env())
+        r = _run_host(cmd, workdir, timeout)
     except subprocess.TimeoutExpired:
         return {"status": "fail", "cmd": " ".join(cmd), "log": f"超时（>{timeout}s）——按门禁失败处理"}
     except FileNotFoundError:
         return {"status": "fail", "cmd": " ".join(cmd),
                 "log": f"命令 {cmd[0]} 不存在（部署机未安装），门禁无法执行"}
+    except (OutputLimitExceeded, BackgroundProcessLeftover) as exc:
+        return {"status": "fail", "cmd": " ".join(cmd), "log": str(exc)}
     log = (r.stdout + "\n" + r.stderr).strip()
     if r.returncode == 127 or "command not found" in log[:500]:
         return {"status": "fail", "cmd": " ".join(cmd),
@@ -169,18 +197,14 @@ def _install_cmd(workdir: Path) -> list | None:
 
 def _run_sandboxed(cmd: list, workdir: Path, timeout: int, cfg: dict | None,
                    cache_id, purpose: str, install_aware: bool = True) -> dict:
-    """显式允许的主机执行或 Docker 沙盒执行；测试类门禁可先安装依赖。"""
+    """默认本机独立进程环境，旧配置可选 Docker；测试类门禁可先安装依赖。"""
     c = _norm_cfg(cfg)
     if c["sandbox"] != "docker":
-        if os.environ.get("HUB_ALLOW_HOST_GATES") != "1":
-            return {"status": "fail", "cmd": purpose,
-                    "log": "主机模式会执行未审查的仓库代码，环境变量白名单不能隔离服务器文件。"
-                           "默认禁止；请配置 Docker 沙盒，或仅在可信仓库上显式设置 HUB_ALLOW_HOST_GATES=1"}
         return _exec(cmd, workdir, timeout)
     if not docker_available():
         return {"status": "fail", "cmd": purpose,
                 "log": "沙盒门禁已选择 Docker，但本机没有 docker 命令——fail loud；"
-                       "安装 Docker；可信仓库也可显式设置 HUB_ALLOW_HOST_GATES=1 后选本机模式"}
+                       "安装 Docker，或将该门禁改为本机执行（仅用于可信仓库）"}
     image = c["image"] or _auto_image(workdir)
     network = c["network"]
     notes = ""
@@ -296,10 +320,13 @@ def run_semgrep(workdir: Path, files: list, timeout: int = 900,
     cmd = ["semgrep", "scan", "--json", "--quiet",
            "--config", "p/default", "--config", "p/secrets", "--"] + path_args
     try:
-        r = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True,
-                           timeout=timeout, env=_gate_env())
+        r = _run_host(cmd, workdir, timeout)
     except subprocess.TimeoutExpired:
         return {"status": "fail", "cmd": " ".join(cmd), "log": f"semgrep 超时（>{timeout}s）"}
+    except FileNotFoundError:
+        return {"status": "fail", "cmd": "semgrep", "log": "semgrep 命令不可用，安全门禁未执行"}
+    except (OutputLimitExceeded, BackgroundProcessLeftover) as exc:
+        return {"status": "fail", "cmd": "semgrep", "log": str(exc)}
     head = f"semgrep 扫描 {len(path_args)} 个变更文件"
     return _parse_semgrep({"returncode": r.returncode, "stdout": r.stdout,
                            "stderr": r.stderr, "status": "ok" if r.returncode < 2 else "fail",
