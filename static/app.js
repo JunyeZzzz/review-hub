@@ -1425,6 +1425,7 @@ async function renderRun(id, silent) {
     patchRunDynamic(prev, fresh);
     runCache[id] = fresh;
   }
+  if (fresh.status !== "queued" && fresh.status !== "running") autoRefresh(null, false);
 }
 
 function runBannerHtml(run) {
@@ -2065,15 +2066,13 @@ async function refreshEvalLive() {
 
 function pollEval() {
   autoRefresh(async () => {
+    if (location.hash !== "#/workbench") return;
     const running = await refreshEvalLive();
+    if (location.hash !== "#/workbench") return;
     if (!running) {
       autoRefresh(null, false);
       toast("评测完成：结果已写入跑分历史");
-      if (location.hash === "#/workbench") { renderWorkbench(); return; }
-      const d = await api("/api/eval/last");
-      const pos = d.cases.filter((c) => c.polarity === "positive").length;
-      $("eval-cases").innerHTML = evalCasesHtml(d.cases);
-      bindEvalActions();
+      renderWorkbench();
     }
   }, true);
 }
@@ -2615,7 +2614,7 @@ function openNodeEditor(draft, index, repaint, onCancel = null) {
   dialog.innerHTML = `<form method="dialog" class="rh-dialog-inner"><div class="node-dialog-head"><div><span class="node-kind ${s.kind}">${NODE_KIND[s.kind]}</span>
       <h2>配置节点 ${index + 1}</h2></div><button type="button" class="ghost" data-close aria-label="关闭">×</button></div>
       ${common}${specific}<div class="rh-dialog-actions"><button type="button" class="ghost" data-close>取消</button>
-      <button type="submit" class="primary">应用到草稿</button></div></form>`;
+      <button type="submit" class="primary" ${s.kind === "api" && !nodeCredentials.some((c) => !c.disabled) ? "disabled" : ""}>应用到草稿</button></div></form>`;
   document.body.appendChild(dialog);
   if (s.kind === "gate") dialog.querySelectorAll('input[name="sandbox"]').forEach((radio) => {
     radio.onchange = () => { dialog.querySelector("[data-docker-options]").hidden = radio.value !== "docker"; };
@@ -2634,7 +2633,13 @@ function openNodeEditor(draft, index, repaint, onCancel = null) {
     } else {
       s.model = String(data.get("model") || "").trim();
       s.prompt = String(data.get("prompt") || "").trim();
-      if (s.kind === "api") s.credential_id = +data.get("credential_id");
+      if (s.kind === "api") {
+        const cid = data.get("credential_id");
+        if (!cid || !nodeCredentials.some((c) => !c.disabled && String(c.id) === cid)) {
+          toast("请先选择可用的模型 API 凭证", true); return;
+        }
+        s.credential_id = Number(cid);
+      }
       else s.provider = data.get("provider");
     }
     draft[index] = s;

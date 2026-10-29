@@ -4,6 +4,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -75,6 +76,57 @@ class DefaultBranchWorkflowTest(unittest.TestCase):
             request.return_value.json.return_value = {}
             github.attach_webhook("owner/repo", "https://hub.example", token="test-token")
         self.assertEqual(request.call_args.kwargs["json"]["events"], ["push"])
+
+    def test_secret_scan_block_keeps_important_evidence(self):
+        repo = self.root / "secret-repo"
+        repo.mkdir()
+        def git(*args):
+            return subprocess.run(["git", *args], cwd=repo, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git("init", "-b", "main")
+        (repo / "safe.txt").write_text("safe\n")
+        git("add", ".")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "first")
+        before = git("rev-parse", "HEAD")
+        (repo / "leak.txt").write_text("aws_access_key_id=" + "AKIA" + "IOSFODNN7EXAMPLE" + "\n")
+        git("add", ".")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "leak")
+        after = git("rev-parse", "HEAD")
+        rid = db.execute(
+            "INSERT INTO runs(project_id,trigger,ref,base_ref,head_sha,status,created_at) "
+            "VALUES(?,?,?,?,?,'queued',?)", (self.pid, "push", "main", before, after, db.now()))
+        with patch.object(worker, "_prepare", return_value=repo):
+            worker._process_run(db.get("SELECT * FROM runs WHERE id=?", (rid,)),
+                                db.get("SELECT * FROM projects WHERE id=?", (self.pid,)))
+        result = db.get("SELECT status,important_count,findings_json FROM runs WHERE id=?", (rid,))
+        self.assertEqual((result["status"], result["important_count"]), ("blocked", 1))
+        self.assertEqual(json.loads(result["findings_json"])[0]["severity"], "IMPORTANT")
+
+    def test_human_review_names_and_readme_404(self):
+        reviews = [
+            {"user": {"login": "claude-agent", "type": "User"}, "state": "APPROVED"},
+            {"user": {"login": "github-actions[bot]", "type": "Bot"}, "state": "APPROVED"},
+        ]
+        classified = github.classify_reviews(reviews)
+        self.assertEqual(classified["human_approved"], ["claude-agent"])
+        self.assertEqual(classified["agent_approved"], 1)
+        with patch.object(github, "gh", side_effect=RuntimeError("GitHub GET /readme -> 404: missing")) as request:
+            self.assertEqual(github.readme_text("owner/repo", "main"), "")
+            request.assert_called_once()
+
+    def test_utc_cache_and_local_day_boundary(self):
+        now = datetime(2026, 10, 29, 8, 0, tzinfo=timezone.utc)
+        self.assertTrue(main._approval_cache_fresh("2026-10-29T07:56:00.000Z", now))
+        self.assertFalse(main._approval_cache_fresh("2026-10-29T07:54:00.000Z", now))
+        self.assertFalse(main._approval_cache_fresh("2026-10-29T08:01:00.000Z", now))
+        self.assertFalse(main._approval_cache_fresh("bad", now))
+        boundary = main._db_utc_timestamp(now - timedelta(hours=8))
+        db.execute("INSERT INTO runs(project_id,trigger,status,created_at) VALUES(?,'manual','passed',?)",
+                   (self.pid, "2026-10-28T23:59:59.000Z"))
+        db.execute("INSERT INTO runs(project_id,trigger,status,created_at) VALUES(?,'manual','passed',?)",
+                   (self.pid, boundary))
+        with patch.object(main, "_local_day_start_utc", return_value=boundary):
+            self.assertEqual(main.overview()["stats"]["runs_today"], 1)
 
     def test_inactive_auto_revert_cannot_be_enabled(self):
         with self.assertRaises(HTTPException):

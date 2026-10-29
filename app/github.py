@@ -98,8 +98,7 @@ def get_reviews(full_name: str, number: int, *, token: str | None = None) -> lis
 
 def _is_agent(login: str, user_type) -> bool:
     low = login.lower()
-    return (user_type == "Bot" or login.endswith("[bot]") or low.endswith("-bot")
-            or "claude" in low or "codex" in low or "github-actions" in low or "agent" in low)
+    return user_type == "Bot" or low.endswith("[bot]") or low.endswith("-bot")
 
 
 def classify_reviews(reviews: list) -> dict:
@@ -182,19 +181,16 @@ def create_revert_pr(full_name: str, sha: str, is_merge: bool, reason: str, *, t
 # ---------- 内容读取 ----------
 
 def readme_text(full_name: str, branch: str, *, token: str | None = None) -> str:
-    """抓 README（常见文件名逐个试），供初始化画像用。找不到返回空串。"""
-    for name in ("README.md", "README_CN.md", "README.zh-CN.md", "README.txt", "README", "readme.md"):
-        try:
-            r = gh("GET", f"/repos/{full_name}/readme",
-                   token=token,
-                   params={"ref": branch},
-                   headers={"Accept": "application/vnd.github.raw"})
-            return r.text[:12000]
-        except RuntimeError as e:
-            if "404" in str(e):
-                continue
-            raise
-    return ""
+    """GitHub 的 /readme 端点自行发现 README；404 才表示仓库没有。"""
+    try:
+        r = gh("GET", f"/repos/{full_name}/readme", token=token,
+               params={"ref": branch},
+               headers={"Accept": "application/vnd.github.raw"})
+        return r.text[:12000]
+    except RuntimeError as exc:
+        if "-> 404:" in str(exc):
+            return ""
+        raise
 
 
 def get_file(full_name: str, path: str, ref: str, *, token: str | None = None) -> str:

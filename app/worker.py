@@ -469,7 +469,7 @@ def _process_run(run, project) -> None:
         else:
             sl.finish(t0, "fail", json.dumps(scan["findings"], ensure_ascii=False, indent=1))
             _finish(run_id, "blocked", summary="密钥扫描未通过，禁止合入（fail loud）",
-                    findings=[{"severity": "Important", **f, "title": f"密钥泄漏：{f['rule']}",
+                    findings=[{"severity": "IMPORTANT", **f, "title": f"密钥泄漏：{f['rule']}",
                                "condition": f["preview"], "fix": "移除密钥并轮换", "sources": ["gitleaks-like"]}
                               for f in scan["findings"]])
             return

@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -719,7 +720,7 @@ def overview():
     stats = {
         "projects": db.get("SELECT COUNT(*) c FROM projects")["c"],
         "runs_today": db.get(
-            "SELECT COUNT(*) c FROM runs WHERE created_at >= datetime('now','localtime','start of day')")["c"],
+            "SELECT COUNT(*) c FROM runs WHERE created_at >= ?", (_local_day_start_utc(),))["c"],
         "blocked_total": db.get("SELECT COUNT(*) c FROM runs WHERE status='blocked'")["c"],
         "reverted_total": db.get("SELECT COUNT(*) c FROM runs WHERE revert_pr_url IS NOT NULL")["c"],
         "marked_total": db.get("SELECT COUNT(*) c FROM finding_marks")["c"],
@@ -735,15 +736,16 @@ def overview():
 @app.get("/api/metrics")
 def metrics():
     """按周聚合：审查量 / 问题 / 已创建回滚 PR / 人工处置。"""
+    cutoff = _db_utc_timestamp(datetime.now(timezone.utc) - timedelta(days=56))
     runs_rows = db.query(
         "SELECT strftime('%Y-%W', created_at) w, MIN(date(created_at)) start, COUNT(*) runs,"
         " SUM(status='blocked') blocked, SUM(revert_pr_url IS NOT NULL) reverted,"
         " SUM(trigger='pr') pr_runs FROM runs"
-        " WHERE created_at >= datetime('now', '-56 days') GROUP BY w ORDER BY w")
+        " WHERE created_at >= ? GROUP BY w ORDER BY w", (cutoff,))
     mark_rows = db.query(
         "SELECT strftime('%Y-%W', updated_at) w, COUNT(*) marked,"
         " SUM(disposition='false_positive') fp FROM finding_marks"
-        " WHERE updated_at >= datetime('now', '-56 days') GROUP BY w")
+        " WHERE updated_at >= ? GROUP BY w", (cutoff,))
     marks_by_week = {r["w"]: {"marked": r["marked"] or 0, "fp": r["fp"] or 0} for r in mark_rows}
     weeks = []
     for r in runs_rows:
@@ -992,6 +994,28 @@ def eval_run():
 _APPROVAL_TTL = 300   # 秒；GitHub 拉一次有成本，报告页 5 分钟内用缓存
 
 
+def _db_utc_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _local_day_start_utc() -> str:
+    midnight = datetime.combine(datetime.now().date(), datetime.min.time())
+    return _db_utc_timestamp(midnight.astimezone(timezone.utc))
+
+
+def _approval_cache_fresh(approval_at: str | None, now: datetime | None = None) -> bool:
+    if not approval_at:
+        return False
+    try:
+        stamp = datetime.fromisoformat(approval_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if stamp.tzinfo is None:
+        return False
+    age = ((now or datetime.now(timezone.utc)) - stamp).total_seconds()
+    return 0 <= age < _APPROVAL_TTL
+
+
 @app.get("/api/runs/{run_id}/approvals")
 def run_approvals(run_id: int):
     run = db.get("SELECT r.*, p.kind AS project_kind, p.full_name AS repo FROM runs r"
@@ -1008,9 +1032,7 @@ def run_approvals(run_id: int):
             cached = json.loads(run["approval_json"])
         except Exception:
             cached = None
-    import time as _time
-    fresh = cached and run["approval_at"] and \
-        (_time.time() - _time.mktime(_time.strptime(run["approval_at"][:19], "%Y-%m-%dT%H:%M:%S"))) < _APPROVAL_TTL
+    fresh = bool(cached) and _approval_cache_fresh(run["approval_at"])
     if fresh:
         data = cached
     else:
@@ -1102,8 +1124,9 @@ def revert_run(run_id: int):
 @app.get("/api/health")
 def health():
     q = db.get("SELECT SUM(status='queued') q, SUM(status='running') r FROM runs")
-    tot = db.get("SELECT COUNT(*) t FROM runs WHERE created_at >= datetime('now','-7 days')")
-    fail = db.get("SELECT COUNT(*) f FROM runs WHERE status='failed' AND created_at >= datetime('now','-7 days')")
+    cutoff = _db_utc_timestamp(datetime.now(timezone.utc) - timedelta(days=7))
+    tot = db.get("SELECT COUNT(*) t FROM runs WHERE created_at >= ?", (cutoff,))
+    fail = db.get("SELECT COUNT(*) f FROM runs WHERE status='failed' AND created_at >= ?", (cutoff,))
     return {"queued": q["q"] or 0, "running": q["r"] or 0,
             "workers": worker.active_worker_count(),
             "poll": worker.poll_status(),
