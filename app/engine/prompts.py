@@ -4,14 +4,16 @@ from pathlib import Path
 
 from .. import config, db
 
-MAX_DIFF_LINES = 8000
+MAX_REVIEW_PART_LINES = 4000
+MAX_REVIEW_PART_CHARS = 160_000
+MAX_REVIEW_PARTS = 40
 
 DEFAULT_TEMPLATE = """你是交叉评审组中的独立代码评审员。只根据上游项目上下文和你自己核验的证据判断，不参考其他评审员的结论；以怀疑态度专查真实缺陷，不负责夸奖。
 
 ## 输入
 
 - 仓库根目录：`{repo_root}`
-- 本次变更 diff（必读，unified patch）：`{DIFF_FILE}`（是否截断：{truncated}）
+- 本节点待审 diff（必读，unified patch）：`{DIFF_FILE}`。大变更会拆片，系统只在全部片段审完后汇总。
 - 评审规则（必读，严格执行）：`{REVIEW_MD}`
 {profile_section}{intent_section}
 ## 工作方式
@@ -61,9 +63,6 @@ INIT_PROMPT = """根据下面的仓库信息，用**不超过 3 句中文**概�
 {readme}
 """
 
-MAX_DIFF_LINES = 8000
-
-
 def build(workdir: Path, intent: str = "", profile: str = "", diff_spec: str = "") -> dict:
     """生成 diff 与 prompt 文件；提供 diff_spec 时必须严格使用该审查区间。"""
     base = f"origin/{_default_branch(workdir)}"
@@ -85,14 +84,22 @@ def build(workdir: Path, intent: str = "", profile: str = "", diff_spec: str = "
         diff = fallback.stdout
     if not diff.strip():
         raise RuntimeError("审查 diff 为空，不能判定通过")
-    lines = diff.splitlines()
-    truncated = len(lines) > MAX_DIFF_LINES
-    if truncated:
-        diff = "\n".join(lines[:MAX_DIFF_LINES])
+    if any(line.startswith("Binary files ") or
+           line.startswith(("+Subproject commit ", "-Subproject commit "))
+           for line in diff.splitlines()):
+        raise RuntimeError("变更包含二进制文件或子模块指针，文本 diff 无法展示完整内容；需要人工核验，不能自动判定通过")
+    lines = diff.splitlines(keepends=True)
+    parts = _review_parts(lines)
 
     diff_file = workdir / ".hub-diff.patch"
     prompt_file = workdir / ".hub-prompt.txt"
     diff_file.write_text(diff, encoding="utf-8")
+    part_files = []
+    if len(parts) > 1:
+        for index, part in enumerate(parts, 1):
+            path = workdir / f".hub-diff-part-{index}.patch"
+            path.write_text(part, encoding="utf-8")
+            part_files.append(path)
     profile_section = ""
     if profile.strip():
         profile_section = (
@@ -110,14 +117,40 @@ def build(workdir: Path, intent: str = "", profile: str = "", diff_spec: str = "
     prompt_file.write_text(get_template().format(
         repo_root=str(workdir),
         diff_file=str(diff_file),
-        truncated="yes（已截断，请按文件用 Read 抽查）" if truncated else "no",
+        truncated="no（完整变更；大变更会逐片审查）",
         review_md=str(config.POLICY_DIR / "REVIEW.md"),
         intent_section=intent_section,
         profile_section=profile_section,
     ), encoding="utf-8")
     return {"prompt_file": prompt_file, "diff_file": diff_file,
-            "diff_lines": len(lines), "truncated": truncated,
+            "diff_lines": len(lines), "truncated": False,
+            "review_parts": part_files,
             "intent": intent, "profile": profile}
+
+
+def _review_parts(lines: list[str]) -> list[str]:
+    """把完整 patch 分成有界输入；每一行恰好进入一个审查片段。"""
+    parts, current, size = [], [], 0
+    last_file, last_hunk = "", ""
+    for number, line in enumerate(lines, 1):
+        if len(line) > MAX_REVIEW_PART_CHARS - 1000:
+            raise RuntimeError("diff 存在超长单行，无法完整审查；请拆分变更")
+        if current and (len(current) >= MAX_REVIEW_PART_LINES or size + len(line) > MAX_REVIEW_PART_CHARS - 500):
+            parts.append("".join(current))
+            prefix = (f"# Review Hub 续片：原始 diff 第 {number} 行；文件 {last_file[:200]}；"
+                      f"所在块 {last_hunk[:200]}。此行以下是该块的后续内容，请按文件核实真实行号。\n")
+            current, size = [prefix], len(prefix)
+        current.append(line)
+        size += len(line)
+        if line.startswith("diff --git "):
+            last_file, last_hunk = line.strip(), ""
+        elif line.startswith("@@ "):
+            last_hunk = line.strip()
+    if current:
+        parts.append("".join(current))
+    if len(parts) > MAX_REVIEW_PARTS:
+        raise RuntimeError(f"变更需拆成 {len(parts)} 个审查片段，超过上限 {MAX_REVIEW_PARTS}；请拆分提交，不能截断后判通过")
+    return parts
 
 
 def _default_branch(workdir: Path) -> str:

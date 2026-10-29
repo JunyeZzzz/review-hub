@@ -109,6 +109,47 @@ class DefaultBranchWorkflowTest(unittest.TestCase):
         root_diff = prompts.build(repo, diff_spec=f"{root_base}..{root_head}")["diff_file"].read_text()
         self.assertIn("first.txt", root_diff)
 
+    def test_large_git_diff_keeps_last_line_and_creates_review_parts(self):
+        repo = self.root / "large-repo"
+        repo.mkdir()
+        def git(*args):
+            return subprocess.run(["git", *args], cwd=repo, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git("init", "-b", "main")
+        (repo / "code.py").write_text("base = 1\n")
+        git("add", ".")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base")
+        before = git("rev-parse", "HEAD")
+        (repo / "code.py").write_text("base = 1\n" +
+                                      "".join(f"changed_line_{i} = {i}\n" for i in range(9001)))
+        git("add", ".")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "large")
+        after = git("rev-parse", "HEAD")
+        built = prompts.build(repo, diff_spec=f"{before}..{after}")
+        self.assertFalse(built["truncated"])
+        self.assertGreater(built["diff_lines"], 8000)
+        self.assertIn("changed_line_9000 = 9000", built["diff_file"].read_text())
+        self.assertGreater(len(built["review_parts"]), 1)
+        self.assertIn("changed_line_9000 = 9000", built["review_parts"][-1].read_text())
+
+    def test_binary_change_cannot_receive_text_only_pass(self):
+        repo = self.root / "binary-repo"
+        repo.mkdir()
+        def git(*args):
+            return subprocess.run(["git", *args], cwd=repo, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git("init", "-b", "main")
+        (repo / "asset.bin").write_bytes(b"\0first")
+        git("add", ".")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "first")
+        before = git("rev-parse", "HEAD")
+        (repo / "asset.bin").write_bytes(b"\0second")
+        git("add", ".")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "second")
+        after = git("rev-parse", "HEAD")
+        with self.assertRaisesRegex(RuntimeError, "人工核验"):
+            prompts.build(repo, diff_spec=f"{before}..{after}")
+
 
 if __name__ == "__main__":
     unittest.main()

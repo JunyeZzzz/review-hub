@@ -2495,7 +2495,7 @@ const PLACEHOLDERS = [
   { code: "{profile_section}", label: "项目画像", required: false },
   { code: "{intent_section}", label: "声明目的", required: false },
   { code: "{repo_root}", label: "仓库路径", required: false },
-  { code: "{truncated}", label: "截断标记", required: false },
+  { code: "{truncated}", label: "完整性状态（旧模板兼容）", required: false },
 ];
 
 const GATE_LABEL = { tests: "测试", build: "构建", semgrep: "安全扫描" };

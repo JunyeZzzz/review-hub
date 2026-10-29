@@ -9,7 +9,7 @@ import httpx
 from fastapi import HTTPException
 
 from app import config, connections, db, main, worker
-from app.engine import api_nodes, verdict
+from app.engine import api_nodes, prompts, verdict
 
 
 class PipelineNodesTest(unittest.TestCase):
@@ -76,6 +76,45 @@ class PipelineNodesTest(unittest.TestCase):
         self.assertIn("发现边界 B", actual_prompt)
         self.assertIn("+def changed", actual_prompt)
         self.assertEqual(run.call_args.args[1], actual_prompt)
+
+    def test_large_diff_reviews_every_part_and_never_returns_partial_pass(self):
+        patch_lines = ["diff --git a/x.py b/x.py\n", "@@ -0,0 +1,9001 @@\n"]
+        patch_lines += [f"+unique_changed_line_{i}\n" for i in range(9001)]
+        parts = prompts._review_parts(patch_lines)
+        self.assertGreater(len(parts), 1)
+        self.assertIn("unique_changed_line_0", parts[0])
+        self.assertIn("unique_changed_line_9000", parts[-1])
+        full = self.root / "full.patch"
+        full.write_text("".join(patch_lines))
+        template = self.root / "prompt.txt"
+        template.write_text(f"审查 {full}")
+        paths = []
+        for i, part in enumerate(parts, 1):
+            path = self.root / f"part-{i}.patch"
+            path.write_text(part)
+            paths.append(path)
+        built = {"diff_file": full, "prompt_file": template, "review_parts": paths}
+        seen = []
+        def review_part(step, prompt):
+            seen.append(prompt)
+            return '```json\n{"findings": []}\n```'
+        with patch.object(api_nodes, "run", side_effect=review_part):
+            output, _, _ = worker._run_reviewer_step(
+                {"kind": "api", "model": "test"}, {}, self.root, built, full.read_text())
+        self.assertEqual(len(seen), len(parts))
+        self.assertEqual(verdict.extract_findings(output), [])
+        self.assertIn("unique_changed_line_9000", seen[-1])
+        with patch.object(api_nodes, "run", side_effect=[
+                '```json\n{"findings": []}\n```', "无效输出"]):
+            with self.assertRaisesRegex(RuntimeError, "不能判定通过"):
+                worker._run_reviewer_step(
+                    {"kind": "api", "model": "test"}, {}, self.root, built, full.read_text())
+
+    def test_too_large_diff_is_rejected_before_review(self):
+        with patch.object(prompts, "MAX_REVIEW_PARTS", 1), \
+             patch.object(prompts, "MAX_REVIEW_PART_LINES", 2):
+            with self.assertRaisesRegex(RuntimeError, "不能截断后判通过"):
+                prompts._review_parts(["one\n", "two\n", "three\n"])
 
     def test_chat_api_node_uses_bound_key_and_parses_text(self):
         cid = api_nodes.create("team-openai", "openai", "secret-123")

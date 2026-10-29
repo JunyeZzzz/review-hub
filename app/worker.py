@@ -138,6 +138,38 @@ def _run_reviewer_step(step: dict, project: dict, workdir: Path,
                        built: dict, diff_text: str, prior: list[dict] | None = None):
     """执行 Agent 或 API 节点，返回 (输出文本, 轨迹, 实际输入)。"""
     prior = prior or []
+    if step.get("purpose", "findings") != "context" and built.get("review_parts"):
+        full_path = str(built["diff_file"])
+        template = built["prompt_file"].read_text(encoding="utf-8")
+        findings, traces, inputs, summaries = [], [], [], []
+        total = len(built["review_parts"])
+        for index, path in enumerate(built["review_parts"], 1):
+            part_prompt = workdir / f".hub-prompt-part-{index}.txt"
+            part_prompt.write_text(template.replace(full_path, str(path)) +
+                                   f"\n## 分片审查 {index}/{total}\n"
+                                   "这只是完整变更的一部分。请逐行检查本片段；需要时读取仓库其他文件验证。"
+                                   "此片段可能从文件或 diff 块中间开始，报告真实文件行号。"
+                                   "不要因为其他片段不可见就断言整个变更没有问题。\n",
+                                   encoding="utf-8")
+            part_built = {**built, "diff_file": path, "prompt_file": part_prompt, "review_parts": []}
+            output, trace, actual_input = _run_reviewer_step(
+                step, project, workdir, part_built, path.read_text(encoding="utf-8"), prior)
+            found = verdict.extract_findings(output)
+            if found is None:
+                raise RuntimeError(f"审查片段 {index}/{total} 未返回有效 findings JSON，不能判定通过")
+            findings.extend(found)
+            summaries.append(f"片段 {index}/{total}：{output.split('```json', 1)[0].strip()}")
+            if len(json.dumps({"findings": findings}, ensure_ascii=False)) > MAX_NODE_OUTPUT_CHARS:
+                raise RuntimeError(f"审查发现超过 {MAX_NODE_OUTPUT_CHARS} 字符上限，不能判定通过")
+            if trace:
+                traces.append({"t": "meta", "text": f"审查片段 {index}/{total}"})
+                traces.extend(trace)
+            inputs.append(f"[审查片段 {index}/{total}]\n{actual_input}")
+        combined = ("\n\n".join(summaries) + "\n\n```json\n" +
+                    json.dumps({"findings": findings}, ensure_ascii=False) + "\n```")
+        if len(combined) > MAX_NODE_OUTPUT_CHARS:
+            raise RuntimeError(f"合并后的审查发现超过 {MAX_NODE_OUTPUT_CHARS} 字符上限，不能判定通过")
+        return combined, traces, "\n\n".join(inputs)
     is_api = step.get("kind") == "api"
     prompt_text = _node_prompt(step, built, prior, workdir, api=is_api)
     if is_api:
@@ -376,7 +408,7 @@ def _process_run(run, project) -> None:
         diff_files = _git(workdir, "diff", "--name-only", diff_spec).stdout.splitlines()
         # 完整 diff 落库（报告页可查，评审对象本体）
         db.execute("UPDATE runs SET diff_text=? WHERE id=?",
-                   (_git(workdir, "diff", diff_spec).stdout[:200000], run_id))
+                   (_git(workdir, "diff", diff_spec).stdout, run_id))
         changed_lines = additions + deletions
         tier_info = router.classify(diff_files, changed_lines)
         db.execute("UPDATE runs SET tier=?, files_changed=? WHERE id=?",
