@@ -13,7 +13,7 @@ done
 if [ ! -d .venv ]; then
   "$PY" -m venv .venv
   ./.venv/bin/pip install -q --upgrade pip
-  ./.venv/bin/pip install -q fastapi 'uvicorn[standard]' httpx pyyaml python-multipart
+  ./.venv/bin/pip install -q -r requirements.txt
 fi
 # 读取 .env（供 codex 桥接配置生成使用）
 if [ -f .env ]; then set -a; source .env; set +a; fi

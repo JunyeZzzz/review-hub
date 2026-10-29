@@ -54,6 +54,7 @@
 ```bash
 ./run.sh          # 首次自动建 venv 装依赖（需要 Python >= 3.10）
 # 打开 http://127.0.0.1:7777
+make test         # 在临时虚拟环境安装 requirements.txt，运行完整单元测试
 ```
 
 ## 配置
