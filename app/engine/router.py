@@ -1,4 +1,4 @@
-"""风险路由：与 quality-gates/policy/risk-rules.yml 同一套规则。"""
+"""按文件路径和变更体量标注风险等级；阻断由实际门禁和发现决定。"""
 import re
 from pathlib import Path
 
@@ -42,9 +42,4 @@ def classify(files: list, changed_lines: int) -> dict:
     else:
         tier = defaults.get("base_tier", "low")
 
-    ai = rules.get("ai_review", {})
-    return {
-        "tier": tier,
-        "run_ai": tier not in ai.get("skip_for", ["trivial"]),
-        "block_on_important": bool(ai.get("block_on_important", {}).get(tier, False)),
-    }
+    return {"tier": tier}

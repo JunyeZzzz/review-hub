@@ -44,6 +44,22 @@ class PipelineNodesTest(unittest.TestCase):
         api_nodes.rotate(cid, "new-secret")
         self.assertNotIn("new-secret", str(api_nodes.list_public()))
 
+    def test_pipeline_rejects_oversize_prompt_instead_of_saving_prefix(self):
+        with self.assertRaisesRegex(HTTPException, "不会静默截断"):
+            main._clean_pipeline([{"kind": "review", "reviewers": [
+                {"kind": "reviewer", "name": "A", "prompt": "x" * 8001}]}])
+        with self.assertRaisesRegex(HTTPException, "不会静默截断"):
+            main._clean_pipeline([{"kind": "gate", "gate": "tests", "id": "g" * 41},
+                                  {"kind": "review", "reviewers": [{"kind": "reviewer", "name": "A"}]}])
+
+    def test_corrupt_pipeline_does_not_fall_back_to_default(self):
+        db.set_setting("pipeline", "{broken")
+        with self.assertRaisesRegex(RuntimeError, "不能悄悄改用默认编排"):
+            worker.get_pipeline()
+        db.set_setting("pipeline", json.dumps(worker.DEFAULT_PIPELINE))
+        with self.assertRaisesRegex(RuntimeError, "不能悄悄改用默认编排"):
+            worker.get_pipeline({"pipeline_json": "[]"})
+
     def test_node_prompt_contains_every_prior_result_and_fails_when_over_budget(self):
         prompt = self.root / "prompt.txt"
         diff = self.root / "diff.patch"

@@ -44,7 +44,8 @@ def _git(workdir: Path, *args: str, check=True):
 
 # ---------- 流水线编排：配置中心可读可写，worker 按它执行 ----------
 
-DEFAULT_GATE = {"id": "gate-test", "kind": "gate", "name": "测试门禁", "gate": "tests", "enabled": True}
+DEFAULT_GATE = {"id": "gate-test", "kind": "gate", "name": "测试门禁", "gate": "tests",
+                "sandbox": "docker", "enabled": True}
 
 DEFAULT_PIPELINE = [
     dict(DEFAULT_GATE),
@@ -63,11 +64,11 @@ def _load_steps(raw) -> list | None:
         return None
     try:
         parsed = json.loads(raw)
-        if isinstance(parsed, list) and parsed:
-            return parsed
-    except Exception:
-        pass
-    return None
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("流水线配置 JSON 无法解析，不能悄悄改用默认编排") from exc
+    if not isinstance(parsed, list) or not parsed:
+        raise RuntimeError("流水线配置不是非空节点列表，不能悄悄改用默认编排")
+    return parsed
 
 
 def normalize_pipeline(steps: list) -> list:
@@ -271,7 +272,7 @@ class StepLog:
 
     def finish(self, t0: float, status: str, log: str = "", trace=None, prompt=None) -> None:
         stored_log = log if len(log) <= MAX_NODE_OUTPUT_CHARS else (
-            log[:MAX_NODE_OUTPUT_CHARS] + "\n[报告日志已截断；执行时使用的完整输出仍传给后续节点]")
+            log[:MAX_NODE_OUTPUT_CHARS] + "\n[报告展示日志超过 200000 字符，后续内容未保存；步骤状态基于完整执行结果]")
         db.execute(
             "UPDATE steps SET status=?, log=?, trace=?, prompt=?, duration_ms=?, finished_at=? WHERE id=?",
             (status, stored_log,
@@ -303,7 +304,7 @@ def _prepare(project: dict, run: dict, sl: StepLog) -> Path:
             log = _ensure_clone(project, workdir)
         if run["head_sha"]:
             _git_retry(workdir, "checkout", "--detach", "-f", run["head_sha"])
-        _git_retry(workdir, "clean", "-fd")
+        _git_retry(workdir, "clean", "-fdx")
         sl.finish(t0, "ok", log)
         return workdir
     except Exception as e:
@@ -314,7 +315,7 @@ def _prepare(project: dict, run: dict, sl: StepLog) -> Path:
 def _diff_range(workdir: Path, run: dict, project: dict) -> tuple[str, str]:
     """返回 (base_ref, head_ref) 的 git 区间，用于 diff。"""
     if run["trigger"] == "pr" and run["head_sha"]:
-        return f"origin/{project['default_branch']}", run["head_sha"]
+        return run["base_ref"] or f"origin/{project['default_branch']}", run["head_sha"]
     head = run["head_sha"] or "HEAD"
     if run["trigger"] == "push" and run["base_ref"]:
         return run["base_ref"], head
@@ -325,6 +326,23 @@ def _diff_range(workdir: Path, run: dict, project: dict) -> tuple[str, str]:
         return empty.stdout.strip(), head
     base = f"{head}~1" if len(parents) == 2 else f"{head}^1"
     return base, head
+
+
+MAX_INTENT_CHARS = 60_000
+
+
+def _intent_for_range(workdir: Path, run: dict, diff_spec: str, fallback: str) -> str:
+    """累计 push 的审查意图来自整段提交，不能只取最后一个 commit message。"""
+    if run["trigger"] != "push" or not run["base_ref"]:
+        return fallback
+    history = _git(workdir, "log", "--reverse", "--format=%h %s%n%b%x00", diff_spec).stdout
+    messages = [item.strip() for item in history.split("\x00") if item.strip()]
+    if not messages:
+        raise RuntimeError(f"审查区间 {diff_spec} 没有可读取的提交说明，无法确认变更意图")
+    intent = f"本次审查覆盖 {len(messages)} 个提交（按时间顺序）：\n" + "\n\n".join(messages)
+    if len(intent) > MAX_INTENT_CHARS:
+        raise RuntimeError(f"提交说明共 {len(intent)} 字符，超过 {MAX_INTENT_CHARS} 上限；请拆分审查，不能只保留最后一个提交说明")
+    return intent
 
 
 def _checkout(workdir: Path, run: dict) -> None:
@@ -379,7 +397,8 @@ def _process_run(run, project) -> None:
         parts = _git(workdir, "log", "-1", "--format=%H%x00%an%x00%aI%x00%s%x00%b", head).stdout.split("\x00")
         sha, author, date, subject, body = (parts + ["", "", "", "", ""])[:5]
         branch = run["ref"] or project["default_branch"]
-        intent = (subject + "\n\n" + body.strip()).strip()
+        intent = _intent_for_range(workdir, run, diff_spec,
+                                   (subject + "\n\n" + body.strip()).strip())
         if run["pr_number"] and project["kind"] == "github":
             try:
                 pr = github.get_pull(project["full_name"], run["pr_number"],
@@ -407,7 +426,7 @@ def _process_run(run, project) -> None:
         t0 = sl.start("风险路由")
         diff_files = _git(workdir, "diff", "--name-only", diff_spec).stdout.splitlines()
         # 完整 diff 落库（报告页可查，评审对象本体）
-        db.execute("UPDATE runs SET diff_text=? WHERE id=?",
+        db.execute("UPDATE runs SET diff_text=?, diff_complete=1 WHERE id=?",
                    (_git(workdir, "diff", diff_spec).stdout, run_id))
         changed_lines = additions + deletions
         tier_info = router.classify(diff_files, changed_lines)
@@ -440,13 +459,26 @@ def _process_run(run, project) -> None:
             raise RuntimeError("流水线需要一个启用且包含评审器的交叉评审组")
 
         reviewers_out = []   # (步骤名, 输出文本)
+        gate_nits = []
         prior = []           # 只包含上游 LLM 上下文节点的最终输出
         built = None
         for step in pipeline:
             if step.get("kind") == "gate":
-                blocked, _, _ = _run_gate(step, project, run, workdir, diff_files, sl)
+                blocked, _, _, scan_findings = _run_gate(step, project, run, workdir, diff_files, sl)
                 if blocked:
                     return   # 门禁红灯已收尾（fail loud），后续步骤不再执行
+                # 测试/构建可能修改源文件、生成忽略文件；后续模型只能读原提交。
+                _git_retry(workdir, "checkout", "--detach", "-f", sha)
+                _git_retry(workdir, "clean", "-fdx")
+                built = None  # 若门禁位于上下文节点之后，重新生成被清理的 prompt/diff 文件。
+                for f in scan_findings:
+                    if f.get("severity") == "NIT":
+                        gate_nits.append({
+                            "severity": "NIT", "file": f.get("file", ""), "line": f.get("line", 0),
+                            "title": f"安全扫描：{f.get('rule', '?')}",
+                            "condition": f.get("condition") or f.get("preview") or "规则命中",
+                            "fix": "核对安全扫描提示", "sources": ["gate:semgrep"],
+                        })
                 continue
             if built is None:
                 built = prompts.build(workdir, intent=intent, profile=project["profile"] or "",
@@ -473,6 +505,9 @@ def _process_run(run, project) -> None:
             if any(verdict.extract_findings(output) is None for _, output in reviewers_out):
                 raise RuntimeError("评审器未返回有效 findings JSON，不能判定通过")
             merged = verdict.merge_multi(reviewers_out)
+            if gate_nits:
+                merged["findings"].extend(gate_nits)
+                merged["summary"] += f"；安全扫描提示 {len(gate_nits)} 条"
             sl.finish(t0, "ok", f"评审来源：{'、'.join(s for s, _ in reviewers_out) or '无'}；{merged['summary']}")
         except Exception as e:
             sl.finish(t0, "fail", str(e))
@@ -496,8 +531,8 @@ def _process_run(run, project) -> None:
 
 
 def _run_gate(step: dict, project: dict, run: dict, workdir: Path,
-              diff_files: list, sl: StepLog) -> tuple[bool, str, str]:
-    """返回 (是否阻断, 状态, 日志)；日志只供报告复盘，不传给模型。"""
+              diff_files: list, sl: StepLog) -> tuple[bool, str, str, list]:
+    """返回 (是否阻断, 状态, 日志, 结构化发现)；日志不传给模型。"""
     name = step.get("name") or f"门禁:{step.get('gate', 'tests')}"
     gtype = step.get("gate") or "tests"
     t0 = sl.start(name)
@@ -507,32 +542,42 @@ def _run_gate(step: dict, project: dict, run: dict, workdir: Path,
             gr = gates.run_semgrep(workdir, diff_files, **kw)
         elif gtype == "build":
             gr = gates.run_build(workdir, **kw)
-        else:
+        elif gtype == "tests":
             gr = gates.run_tests(workdir, **kw)
+        else:
+            raise RuntimeError(f"未知门禁类型：{gtype}；不能改为测试门禁继续执行")
+        if gr.get("status") not in ("ok", "skip", "fail"):
+            raise RuntimeError(f"门禁 {gtype} 返回无效状态 {gr.get('status')!r}，不能判定通过")
     except Exception as e:
         sl.finish(t0, "fail", str(e))
         _block_by_gate(project, run, name, gtype, "门禁执行器异常（fail loud）", str(e)[-2000:])
-        return True, "fail", str(e)
+        return True, "fail", str(e), []
     sl.finish(t0, gr["status"], gr.get("log", ""))
     if gr["status"] != "fail":
-        return False, gr["status"], gr.get("log", "")
+        return False, gr["status"], gr.get("log", ""), gr.get("findings") or []
     _block_by_gate(project, run, name, gtype,
-                   gr.get("cmd") or "门禁失败", gr.get("log", ""))
-    return True, "fail", gr.get("log", "")
+                   gr.get("cmd") or "门禁失败", gr.get("log", ""), gr.get("findings"))
+    return True, "fail", gr.get("log", ""), gr.get("findings") or []
 
 
 def _block_by_gate(project: dict, run: dict, name: str, gtype: str,
-                   condition: str, log: str) -> None:
-    """门禁红灯收尾：blocked + 一条 Important 发现（file 为空，报告页显示为门禁卡片）。"""
-    finding = {"severity": "IMPORTANT", "file": "", "line": 0,
-               "title": f"{name}未通过",
-               "condition": f"{condition}（日志末尾：{log[-300:]}）" if log else condition,
-               "fix": "先让门禁变绿再合入；在报告页「审查过程」展开该步骤看完整日志",
-               "sources": [f"gate:{gtype}"]}
-    _finish(run["id"], "blocked", summary=f"{name}未通过（fail loud）：{condition}", findings=[finding])
+                   condition: str, log: str, scan_findings: list | None = None) -> None:
+    """门禁红灯收尾：扫描命中保留逐条证据，执行故障生成一条门禁发现。"""
+    if gtype == "semgrep" and scan_findings:
+        findings = [{"severity": f["severity"], "file": f["file"], "line": f["line"],
+                     "title": f"安全扫描：{f['rule']}", "condition": f.get("condition") or f.get("preview") or "规则命中",
+                     "fix": "核对扫描证据并修复；确认误报时保留处置依据",
+                     "sources": ["gate:semgrep"]} for f in scan_findings]
+    else:
+        findings = [{"severity": "IMPORTANT", "file": "", "line": 0,
+                     "title": f"{name}未通过",
+                     "condition": f"{condition}（日志末尾：{log[-300:]}）" if log else condition,
+                     "fix": "修复门禁执行或检查失败原因后重审；在报告页展开步骤日志",
+                     "sources": [f"gate:{gtype}"]}]
+    _finish(run["id"], "blocked", summary=f"{name}未通过（fail loud）：{condition}", findings=findings)
     if project["kind"] == "github":
         _github_followup(project, run,
-                         {"findings": [finding], "important_count": 1,
+                         {"findings": findings, "important_count": sum(f["severity"] == "IMPORTANT" for f in findings),
                           "summary": f"{name}未通过"},
                          "blocked")
 
@@ -641,7 +686,7 @@ def _poll_once() -> None:
             print(f"[hub] 轮询 {full} 失败：{e}")
             errors.append(f"{full}: {e}")
     if errors:
-        raise RuntimeError("；".join(errors[:3]))
+        raise RuntimeError(f"{len(errors)} 个项目轮询失败：" + "；".join(errors))
 
 
 # ---------- 提交历史缓存：项目页秒开的关键 ----------
@@ -687,7 +732,7 @@ def get_commits(p: dict, limit: int = 30) -> tuple[list, str]:
     except Exception as e:
         err = str(e)
         if hit and now - hit["ts"] < 3600:   # 有旧缓存就先用旧的
-            return hit["data"], ""
+            return hit["data"], f"获取最新提交失败，当前显示缓存：{err}"
     if not err:
         _COMMITS_CACHE[key] = {"ts": now, "data": commits}
     else:

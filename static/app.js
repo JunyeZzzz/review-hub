@@ -315,8 +315,8 @@ async function renderHome() {
         <div class="num">${s.runs_today}</div><div class="label">今日审查</div></div>
       <div class="panel stat clickable" data-jump="#/runs?status=blocked" title="看被阻断的审查">
         <div class="num" style="color:var(--bad)">${s.blocked_total}</div><div class="label">发现问题（累计）</div></div>
-      <div class="panel stat clickable" data-jump="#/runs?reverted=1" title="看触发回滚的审查">
-        <div class="num" style="color:var(--warn)">${s.reverted_total}</div><div class="label">触发回滚</div></div>
+      <div class="panel stat clickable" data-jump="#/runs?reverted=1" title="查看已创建回退 PR 的审查">
+        <div class="num" style="color:var(--warn)">${s.reverted_total}</div><div class="label">已创建回退 PR</div></div>
       <div class="panel stat clickable" data-jump="#/marks" title="打开处置台账">
         <div class="num" style="color:${s.fp_total > s.marked_total / 2 ? "var(--warn)" : "inherit"}">${fpRate}</div>
         <div class="label">误报率（已处置 ${s.marked_total || 0} 条）</div></div>
@@ -419,9 +419,9 @@ async function renderMetrics() {
         <div class="label">本周发现问题</div></div>
       <div class="panel stat clickable" data-jump="#/runs?reverted=1">
         <div class="num" style="color:var(--warn)">${cur ? cur.reverted : 0}</div>
-        <div class="label">本周回滚（率 ${cur ? cur.revert_rate : 0}%）</div></div>
+        <div class="label">本周创建回退 PR</div></div>
       <div class="panel stat clickable" data-jump="#/runs?trigger=pr">
-        <div class="num">${cur ? cur.pr_runs : 0}</div><div class="label">本周 PR 审查</div></div>
+        <div class="num">${cur ? cur.pr_runs : 0}</div><div class="label">本周 PR 触发审查</div></div>
       <div class="panel stat clickable" data-jump="#/marks">
         <div class="num">${cur && cur.marked ? cur.fp_rate + "%" : "—"}</div>
         <div class="label">误报率（处置 ${cur ? cur.marked : 0} 条）</div></div>
@@ -429,7 +429,7 @@ async function renderMetrics() {
 
     <div class="sec-title stagger">周趋势 <span class="faint small mono" style="letter-spacing:0;text-transform:none">点任意数字下钻</span></div>
     <div class="panel stagger">${weeks.length ? `<table><thead><tr>
-        <th>周</th><th>审查</th><th>发现问题</th><th>回滚</th><th>回滚率</th><th>PR 审查</th><th>处置 / 误报</th></tr></thead>
+        <th>周</th><th>审查</th><th>发现问题</th><th>已创建回退 PR</th><th>PR 触发审查</th><th>处置 / 误报</th></tr></thead>
       <tbody>${weeks.map((w) => `
         <tr>
           <td class="mono small muted">${esc(w.start || w.week)}</td>
@@ -438,7 +438,6 @@ async function renderMetrics() {
           <td>${w.blocked ? `<a href="#/runs?since=${esc(w.start || "")}&status=blocked"
             style="display:block;color:inherit"><span class="badge imp">${w.blocked}</span></a>` : '<span class="faint">—</span>'}</td>
           <td>${cell(w.reverted ? `${w.reverted}` : "—", `#/runs?since=${esc(w.start || "")}&reverted=1`)}</td>
-          <td class="mono small ${w.revert_rate > 30 ? "del" : "muted"}">${w.reverted ? w.revert_rate + "%" : "—"}</td>
           <td>${cell(w.pr_runs || "—", `#/runs?since=${esc(w.start || "")}&trigger=pr`)}</td>
           <td>${w.marked ? cell(`${w.marked} / <span class="del">${w.fp}</span>（${w.fp_rate}%）`, "#/marks") : '<span class="faint">—</span>'}</td>
         </tr>`).join("")}</tbody></table>`
@@ -498,7 +497,7 @@ async function renderRunsList(qs = "") {
       ${Object.entries(opts).map(([v, l]) => `<button class="rf-chip ${val === v ? "on" : ""}"
         data-rf="${key}" data-value="${v}">${l}</button>`).join("")}</div></div>`;
   const titleBits = [status && STATUS_LABEL[status], trigger && TRIGGER_LABEL[trigger],
-    reverted && "已回滚", since && `自 ${since}`].filter(Boolean).join(" · ");
+    reverted && "已创建回退 PR", since && `自 ${since}`].filter(Boolean).join(" · ");
   $app.innerHTML = `
     ${pageHead({
       title: `审查${titleBits ? ` <span class="muted" style="font-size:14px;font-weight:400">· ${esc(titleBits)}</span>` : ""}`,
@@ -507,7 +506,7 @@ async function renderRunsList(qs = "") {
     <div class="rf-toolbar">
       ${chips("status", status, STATUS_LABEL, "结果")}
       ${chips("trigger", trigger, TRIGGER_LABEL, "触发")}
-      <div class="rf-extra"><label class="small"><input type="checkbox" id="rf-reverted" ${reverted ? "checked" : ""}> 仅看回滚</label>
+      <div class="rf-extra"><label class="small"><input type="checkbox" id="rf-reverted" ${reverted ? "checked" : ""}> 仅看已创建回退 PR</label>
         <label class="small">起始日期 <input type="date" id="rf-since" value="${esc(since)}"></label>
         <button class="ghost small-btn" id="rf-clear">清除筛选</button></div>
     </div>
@@ -1430,8 +1429,10 @@ async function renderRun(id, silent) {
 
 function runBannerHtml(run) {
   return {
-    passed: `<div class="banner passed"><span class="mark"></span><div><b>通过</b> —— 未发现会导致线上问题的事项</div></div>`,
-    blocked: `<div class="banner blocked"><span class="mark"></span><div><b>发现问题</b> —— ${run.important_count} 个 Important；${run.revert_pr_url ? `已自动创建回滚 PR：<a href="${esc(run.revert_pr_url)}" target="_blank">${esc(run.revert_pr_url)}</a>` : "请修复发现；已进入默认分支的变更可按需创建回滚 PR"}</div></div>`,
+    passed: run.diff_complete === 1
+      ? `<div class="banner passed"><span class="mark"></span><div><b>审查完成</b> —— 完整变更已输入评审，未报告 Important；这不保证没有遗漏。</div></div>`
+      : `<div class="banner failed"><span class="mark"></span><div><b>历史记录标记为通过</b> —— 当时未记录 diff 完整性，旧版可能截断审查输入；需要可信结论请重新审查。</div></div>`,
+    blocked: `<div class="banner blocked"><span class="mark"></span><div><b>发现问题</b> —— ${run.important_count} 个 Important；${run.revert_pr_url ? `已自动创建回滚 PR：<a href="${esc(run.revert_pr_url)}" target="_blank">${esc(run.revert_pr_url)}</a>` : "请修复发现；已进入默认分支的变更可按需创建回滚 PR"}${run.diff_complete === 1 ? "" : "。历史输入完整性未知，可能还有未检查的变更"}</div></div>`,
     failed: `<div class="banner failed"><span class="mark"></span><div><b>执行失败</b> —— ${esc(run.error || "未知错误")}（引擎异常不会判定通过）
       <div class="failure-triage-state">${run.failure_action === "handled" ? `✓ 已标记处理 · ${fmtTime(run.failure_at)}${run.failure_note ? ` · ${esc(run.failure_note)}` : ""}`
         : "仍在工作台待处理；标记处理只移出待办，不会把这次审查改为通过。"}</div>
@@ -1590,10 +1591,34 @@ function paintRunShell(run) {
       <aside class="run-side">
         <div class="sec-title">变更上下文</div>
         <div class="panel ctx" id="run-kv">${runKvHtml(run)}</div>
+        <div id="run-diff-control"></div>
         <div class="sec-title">执行流水线</div>
         <div class="panel" id="run-pipeline" style="padding:12px 18px"></div>
       </aside>
-    </div>`;
+    </div>
+    <section class="panel run-diff-panel" id="run-diff-panel" hidden></section>`;
+}
+
+async function showRunDiff(run) {
+  const box = $("run-diff-panel");
+  if (!box) return;
+  box.hidden = false;
+  box.textContent = "正在读取本次 diff…";
+  try {
+    const result = await api(`/api/runs/${run.id}/diff`);
+    if (location.hash !== `#/runs/${run.id}` || !box.isConnected) return;
+    box.innerHTML = `<div class="run-diff-head"><div><h3>${result.complete ? "本次完整 diff" : "历史 diff（完整性未知）"}</h3>
+      ${result.complete ? "" : '<p>旧版可能只保存了部分 diff，也可能只给评审器看了前半段；这份历史结果不能证明完整审查。</p>'}</div>
+      <div class="actions"><button class="ghost small-btn" data-copy-diff>复制 diff</button>
+      <button class="ghost small-btn" data-close-diff>收起</button></div></div><pre class="run-diff-content"></pre>`;
+    box.querySelector("pre").textContent = result.diff;
+    box.querySelector("[data-copy-diff]").onclick = async () => {
+      try { await navigator.clipboard.writeText(result.diff); toast("完整 diff 已复制"); }
+      catch (e) { toast("复制失败：" + e.message, true); }
+    };
+    box.querySelector("[data-close-diff]").onclick = () => { box.hidden = true; box.innerHTML = ""; };
+    box.scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (e) { box.textContent = `读取 diff 失败：${e.message}`; }
 }
 
 function patchRunDynamic(prev, fresh) {
@@ -1604,7 +1629,7 @@ function patchRunDynamic(prev, fresh) {
   }
   // banner
   const $b = $("banner-box");
-  if ($b && (pv.status !== fresh.status || pv.revert_pr_url !== fresh.revert_pr_url
+  if ($b && (pv.status !== fresh.status || pv.diff_complete !== fresh.diff_complete || pv.revert_pr_url !== fresh.revert_pr_url
       || pv.important_count !== fresh.important_count || pv.failure_action !== fresh.failure_action)) {
     $b.innerHTML = runBannerHtml(fresh);
   }
@@ -1640,6 +1665,15 @@ function patchRunDynamic(prev, fresh) {
   const $k = $("run-kv");
   const kv = runKvHtml(fresh);
   if ($k && $k.innerHTML !== kv) $k.innerHTML = kv;
+  const $dc = $("run-diff-control");
+  if ($dc) {
+    const html = fresh.has_diff
+      ? `<button class="ghost small-btn" id="load-run-diff">${fresh.diff_complete === 1 ? "查看完整 diff" : "查看历史 diff（完整性未知）"}</button>`
+      : "";
+    if ($dc.innerHTML !== html) $dc.innerHTML = html;
+    const btn = $("load-run-diff");
+    if (btn) btn.onclick = () => showRunDiff(fresh);
+  }
   // 步骤：按 id 对账，只替换变化的步骤节点
   const sc = $("steps-list");
   if (sc) {
@@ -2499,8 +2533,8 @@ const PLACEHOLDERS = [
 ];
 
 const GATE_LABEL = { tests: "测试", build: "构建", semgrep: "安全扫描" };
-const GATE_TIP = "机械门禁：失败即红灯阻断，不调用模型；仓库无入口或部署机缺工具记 skip（安全扫描缺 semgrep 记红灯）";
-const SANDBOX_TIP = "本机=白名单环境变量执行（token 不进子进程）；Docker=一次性容器，断网+CPU/内存上限+依赖缓存卷，多项目并发互不影响。选 Docker 需本机装 Docker，缺失时该门禁红灯";
+const GATE_TIP = "机械门禁：失败即红灯阻断，不调用模型；仅仓库没有对应入口才跳过。执行工具缺失或安全扫描未完成都记失败";
+const SANDBOX_TIP = "推荐 Docker 沙盒：一次性容器、资源限制和依赖缓存。本机模式会运行仓库代码，可能读取服务器文件，只允许可信仓库且需服务器显式设置 HUB_ALLOW_HOST_GATES=1；仅清理环境变量无法隔离文件。Docker 不可用会阻断门禁";
 
 let nodeCredentials = [];
 const NODE_KIND = { gate: "门禁", reviewer: "Agent", api: "模型 API", review: "交叉评审" };
@@ -2508,7 +2542,7 @@ const NODE_PURPOSE = { findings: "独立评审", context: "提供上游上下文
 function newPipeNode(kind, index) {
   const base = { id: `node-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     kind, name: `${NODE_KIND[kind]}节点 ${index}`, enabled: true };
-  if (kind === "gate") return { ...base, gate: "tests", sandbox: "off", network: "install", image: "" };
+  if (kind === "gate") return { ...base, gate: "tests", sandbox: "docker", network: "install", image: "" };
   if (kind === "api") return { ...base, credential_id: nodeCredentials.find((c) => !c.disabled)?.id || null,
     model: "", purpose: "context", prompt: "" };
   return { ...base, provider: "claude", model: "", purpose: "context", prompt: "" };

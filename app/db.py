@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS runs (
   tier TEXT, summary TEXT,
   important_count INTEGER DEFAULT 0,
   findings_json TEXT,
+  diff_complete INTEGER,              -- NULL=旧报告未知；1=本次保存了完整 diff
   error TEXT,
   files_changed INTEGER DEFAULT 0,
   duration_ms INTEGER,
@@ -130,7 +131,7 @@ CREATE TABLE IF NOT EXISTS eval_runs (
 
 RUN_MIGRATE_COLS = ("branch", "commit_msg", "commit_author", "commit_date", "intent",
                     "additions", "deletions", "approval_json", "approval_at",
-                    "pipeline_snapshot", "diff_text")
+                    "pipeline_snapshot", "diff_text", "diff_complete")
 PROJECT_MIGRATE = (("profile", "TEXT"), ("init_status", "TEXT DEFAULT 'done'"), ("last_sha", "TEXT"))
 STEP_MIGRATE_COLS = ("trace", "prompt")
 
@@ -165,6 +166,8 @@ def init() -> None:
                 "pipeline_snapshot", "diff_text"):
         if col not in existing:
             c.execute(f"ALTER TABLE runs ADD COLUMN {col} TEXT")
+    if "diff_complete" not in existing:
+        c.execute("ALTER TABLE runs ADD COLUMN diff_complete INTEGER")
     pcols = {r[1] for r in c.execute("PRAGMA table_info(projects)")}
     for col, ddl in (("profile", "TEXT"), ("init_status", "TEXT DEFAULT 'done'"),
                      ("last_sha", "TEXT"), ("pipeline_json", "TEXT"),

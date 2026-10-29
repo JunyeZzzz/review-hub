@@ -1,7 +1,7 @@
 """机械门禁：密钥扫描 / 测试 / 构建 / semgrep 安全扫描。
 
 隔离原则（docs/GAP-ANALYSIS.md「我们的风格」）：
-- 门禁在人审之前执行未经审查的代码——主机模式只传白名单环境变量，token 一律不进子进程；
+- 门禁在人审之前执行未经审查的代码；主机模式必须显式开启，环境变量白名单不构成文件隔离；
 - Docker 沙盒模式：一次性容器 + 断网（依赖安装期可单独放网）+ 资源上限 + 按项目的依赖缓存卷；
 - 显式选择了 Docker / 工具而环境不满足 -> fail loud 红灯，不静默跳过。
 """
@@ -9,19 +9,22 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import uuid
 from pathlib import Path
 
 SECRET_PATTERNS = [
     ("AWS Access Key", re.compile(r"AKIA[0-9A-Z]{16}")),
-    ("GitHub Token", re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}")),
+    ("GitHub Token", re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{20,})")),
     ("OpenAI Key", re.compile(r"sk-[A-Za-z0-9]{20,}T3BlbkFJ[A-Za-z0-9]{20,}")),
     ("私钥文件", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
     ("通用高熵赋值", re.compile(r"(?i)(password|passwd|secret|api_key)\s*[:=]\s*['\"][A-Za-z0-9+/_-]{24,}['\"]")),
 ]
 
-SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "dist", "build", "__pycache__"}
+MAX_SECRET_FILE_BYTES = 10_000_000
+SEMGREP_BATCH_SIZE = 300
+MAX_SEMGREP_BATCHES = 40
 
 # pytest 及其依赖缺失时解释器会报 No module named XXX——这是环境问题，不是测试失败
 _MISSING_MODULE_RX = re.compile(r"No module named ['\"]?(pytest|pluggy|iniconfig|hamcrest)['\"]?")
@@ -44,14 +47,20 @@ def scan_secrets(workdir: Path, files: list) -> dict:
     findings = []
     for rel in files:
         p = workdir / rel
-        if not p.is_file() or p.stat().st_size > 1_000_000:
+        try:
+            mode = p.lstat().st_mode
+        except FileNotFoundError:  # 已删除的文件没有当前内容可扫
             continue
-        if set(rel.split("/")) & SKIP_DIRS:
-            continue
+        except OSError as exc:
+            raise RuntimeError(f"密钥扫描无法访问 {rel}：{exc}") from exc
+        if not stat.S_ISREG(mode):
+            raise RuntimeError(f"密钥扫描不能读取非普通文件 {rel}；不能判定通过")
+        if p.stat().st_size > MAX_SECRET_FILE_BYTES:
+            raise RuntimeError(f"密钥扫描无法完整读取 {rel}（超过 {MAX_SECRET_FILE_BYTES} 字节）；不能判定通过")
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
+        except OSError as exc:
+            raise RuntimeError(f"密钥扫描无法读取 {rel}：{exc}") from exc
         for rule, rx in SECRET_PATTERNS:
             m = rx.search(text)
             if m:
@@ -72,19 +81,18 @@ def _exec(cmd: list, workdir: Path, timeout: int) -> dict:
     except subprocess.TimeoutExpired:
         return {"status": "fail", "cmd": " ".join(cmd), "log": f"超时（>{timeout}s）——按门禁失败处理"}
     except FileNotFoundError:
-        return {"status": "skip", "cmd": "",
-                "log": f"命令 {cmd[0]} 不存在（部署机未安装），门禁跳过"}
+        return {"status": "fail", "cmd": " ".join(cmd),
+                "log": f"命令 {cmd[0]} 不存在（部署机未安装），门禁无法执行"}
     log = (r.stdout + "\n" + r.stderr).strip()
     if r.returncode == 127 or "command not found" in log[:500]:
-        return {"status": "skip", "cmd": "",
-                "log": f"{cmd[0]} 不可用（部署机未安装），门禁跳过\n{log[-1500:]}"}
+        return {"status": "fail", "cmd": " ".join(cmd),
+                "log": f"{cmd[0]} 不可用（部署机未安装），门禁无法执行\n{log[-1500:]}"}
     m = _MISSING_MODULE_RX.search(log)
     if m:
-        return {"status": "skip", "cmd": " ".join(cmd),
-                "log": f"部署机缺少 {m.group(1)}（这是环境问题，不是代码失败），门禁跳过——"
-                       f"安装后门禁自动生效\n{log[-1500:]}"}
+        return {"status": "fail", "cmd": " ".join(cmd),
+                "log": f"部署机缺少 {m.group(1)}（环境问题），门禁无法执行；请安装后重审\n{log[-1500:]}"}
     return {"status": "ok" if r.returncode == 0 else "fail",
-            "cmd": " ".join(cmd), "log": log[-8000:] or "(无输出)"}
+            "cmd": " ".join(cmd), "log": log or "(无输出)"}
 
 
 # ---------- Docker 沙盒 ----------
@@ -135,8 +143,8 @@ def _docker_phase(cmd: list, workdir: Path, image: str, net_on: bool,
         return {"status": "fail", "cmd": purpose,
                 "log": f"Docker 不可用：{log[-500:]}——沙盒门禁显式启用却无法执行，fail loud"}
     return {"status": "ok" if r.returncode == 0 else "fail",
-            "cmd": purpose, "log": log[-8000:] or "(无输出)",
-            "returncode": r.returncode, "stdout": r.stdout[-200000:], "stderr": r.stderr[-5000:]}
+            "cmd": purpose, "log": log or "(无输出)",
+            "returncode": r.returncode, "stdout": r.stdout, "stderr": r.stderr[-5000:]}
 
 
 def _norm_cfg(cfg: dict | None) -> dict:
@@ -149,7 +157,9 @@ def _norm_cfg(cfg: dict | None) -> dict:
 
 def _install_cmd(workdir: Path) -> list | None:
     if (workdir / "package.json").exists():
-        return ["sh", "-c", "npm ci --no-audit --no-fund || npm install --no-audit --no-fund"]
+        if (workdir / "package-lock.json").exists() or (workdir / "npm-shrinkwrap.json").exists():
+            return ["npm", "ci", "--no-audit", "--no-fund"]
+        return ["npm", "install", "--no-audit", "--no-fund"]
     if (workdir / "requirements.txt").exists():
         return ["sh", "-c", "pip install -q -r requirements.txt"]
     if (workdir / "pyproject.toml").exists():
@@ -159,14 +169,18 @@ def _install_cmd(workdir: Path) -> list | None:
 
 def _run_sandboxed(cmd: list, workdir: Path, timeout: int, cfg: dict | None,
                    cache_id, purpose: str, install_aware: bool = True) -> dict:
-    """主机白名单执行 或 Docker 沙盒执行。install_aware：测试类门禁先装依赖（安装期放网）。"""
+    """显式允许的主机执行或 Docker 沙盒执行；测试类门禁可先安装依赖。"""
     c = _norm_cfg(cfg)
     if c["sandbox"] != "docker":
+        if os.environ.get("HUB_ALLOW_HOST_GATES") != "1":
+            return {"status": "fail", "cmd": purpose,
+                    "log": "主机模式会执行未审查的仓库代码，环境变量白名单不能隔离服务器文件。"
+                           "默认禁止；请配置 Docker 沙盒，或仅在可信仓库上显式设置 HUB_ALLOW_HOST_GATES=1"}
         return _exec(cmd, workdir, timeout)
     if not docker_available():
         return {"status": "fail", "cmd": purpose,
                 "log": "沙盒门禁已选择 Docker，但本机没有 docker 命令——fail loud；"
-                       "安装 Docker，或在配置中心把该门禁的隔离切回「本机」"}
+                       "安装 Docker；可信仓库也可显式设置 HUB_ALLOW_HOST_GATES=1 后选本机模式"}
     image = c["image"] or _auto_image(workdir)
     network = c["network"]
     notes = ""
@@ -242,9 +256,27 @@ def run_semgrep(workdir: Path, files: list, timeout: int = 900,
     ERROR 级发现 = Important（一票否决阻断）；WARNING/INFO = Nit（可见不阻断）。
     显式启用却缺工具/缺 Docker -> fail loud。Docker 模式用官方 semgrep 镜像，无需本机安装。"""
     c = _norm_cfg(cfg)
-    path_args = [f for f in files if f and not set(f.split("/")) & SKIP_DIRS][:300]
+    path_args = [f for f in files if f and (workdir / f).is_file()]
     if not path_args:
-        return {"status": "skip", "cmd": "", "log": "本次变更没有可扫描的文件，跳过"}
+        return {"status": "skip", "cmd": "", "log": "本次变更没有现存文件可扫描（可能均为删除），跳过"}
+    if len(path_args) > SEMGREP_BATCH_SIZE * MAX_SEMGREP_BATCHES:
+        return {"status": "fail", "cmd": "semgrep",
+                "log": f"本次有 {len(path_args)} 个可扫描文件，超过 {SEMGREP_BATCH_SIZE * MAX_SEMGREP_BATCHES} 个文件的安全扫描上限；不能只扫前一部分"}
+    if len(path_args) > SEMGREP_BATCH_SIZE:
+        findings, notes = [], []
+        for start in range(0, len(path_args), SEMGREP_BATCH_SIZE):
+            batch = path_args[start:start + SEMGREP_BATCH_SIZE]
+            result = run_semgrep(workdir, batch, timeout=timeout, cfg=cfg, cache_id=cache_id)
+            if result["status"] == "fail" and not result.get("findings"):
+                return {"status": "fail", "cmd": "semgrep",
+                        "log": f"第 {start // SEMGREP_BATCH_SIZE + 1} 批扫描失败：{result['log']}"}
+            findings.extend(result.get("findings") or [])
+            notes.append(f"第 {start // SEMGREP_BATCH_SIZE + 1} 批：{len(result.get('findings') or [])} 条发现")
+        important = sum(f["severity"] == "IMPORTANT" for f in findings)
+        return {"status": "fail" if important else "ok", "cmd": "semgrep",
+                "log": f"完整扫描 {len(path_args)} 个文件，Important {important} / 共 {len(findings)} 条；" +
+                       "；".join(notes) + "\n" + json.dumps(findings, ensure_ascii=False),
+                "findings": findings}
 
     if c["sandbox"] == "docker":
         if not docker_available():
@@ -286,12 +318,15 @@ def _parse_semgrep(r: dict, head: str, raw_cmd: str = "semgrep") -> dict:
         return {"status": "fail", "cmd": raw_cmd,
                 "log": head + f"——semgrep 输出无法解析（退出码 {rc}）：\n"
                        f"{((r.get('stdout') or '') + (r.get('stderr') or r.get('log') or ''))[-3000:]}"}
-    if rc >= 2:   # semgrep 约定：0=干净 1=有发现 2+=扫描本身出错
+    if rc not in (0, 1):   # semgrep 约定：0=干净 1=有发现 2+=扫描本身出错
         return {"status": "fail", "cmd": raw_cmd,
                 "log": head + f"——semgrep 扫描本身失败（退出码 {rc}，fail loud）：\n"
                        f"{((r.get('stderr') or '') + (r.get('stdout') or ''))[-3000:]}"}
+    if not isinstance(data, dict) or not isinstance(data.get("results"), list) or data.get("errors"):
+        return {"status": "fail", "cmd": raw_cmd,
+                "log": head + "——semgrep 响应缺少完整 results 或包含扫描错误，不能判定干净"}
     findings = []
-    for res in data.get("results") or []:
+    for res in data["results"]:
         extra = res.get("extra") or {}
         sev = str(extra.get("severity") or "INFO").upper()
         findings.append({
@@ -305,6 +340,6 @@ def _parse_semgrep(r: dict, head: str, raw_cmd: str = "semgrep") -> dict:
     imp = sum(1 for f in findings if f["severity"] == "IMPORTANT")
     log = (head + f"：Important {imp} / 共 {len(findings)} 条"
            f"（ERROR 级一票否决，WARNING/INFO 记为 Nit）\n"
-           + json.dumps(findings, ensure_ascii=False, indent=1)[:6000])
+           + json.dumps(findings, ensure_ascii=False, indent=1))
     return {"status": "fail" if imp else "ok", "cmd": raw_cmd,
             "log": log, "findings": findings}

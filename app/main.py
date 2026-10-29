@@ -262,15 +262,22 @@ def delete_model_credential(cid: int):
     return {"ok": True}
 
 
+def _bounded_text(value, limit: int, label: str) -> str:
+    text = str(value or "")
+    if len(text) > limit:
+        raise HTTPException(400, f"{label}超过 {limit} 字符；请缩短后保存，系统不会静默截断")
+    return text
+
+
 def _clean_model_node(s: dict, purpose: str, fallback: str) -> dict:
     kind = s.get("kind") or "reviewer"
     common = {
-        "id": str(s.get("id") or fallback)[:40],
+        "id": _bounded_text(s.get("id") or fallback, 40, "节点 ID"),
         "kind": kind,
-        "name": str(s.get("name") or "模型节点")[:40],
+        "name": _bounded_text(s.get("name") or "模型节点", 40, "节点名称"),
         "enabled": bool(s.get("enabled", True)),
-        "model": str(s.get("model") or "")[:80],
-        "prompt": str(s.get("prompt") or "")[:8000],
+        "model": _bounded_text(s.get("model"), 80, "模型 ID"),
+        "prompt": _bounded_text(s.get("prompt"), 8000, "节点提示词"),
         "purpose": purpose,
     }
     if kind == "reviewer":
@@ -307,14 +314,14 @@ def _clean_pipeline(steps) -> list:
             if g not in ("tests", "build", "semgrep"):
                 raise HTTPException(400, "未知门禁类型")
             clean.append({
-                "id": str(s.get("id") or f"gate{len(clean)}")[:40],
+                "id": _bounded_text(s.get("id") or f"gate{len(clean)}", 40, "门禁 ID"),
                 "kind": "gate",
-                "name": str(s.get("name") or "门禁")[:40],
+                "name": _bounded_text(s.get("name") or "门禁", 40, "门禁名称"),
                 "gate": g,
                 "enabled": bool(s.get("enabled", True)),
                 "sandbox": "docker" if s.get("sandbox") == "docker" else "off",
                 "network": s.get("network") if s.get("network") in ("off", "install", "on") else "install",
-                "image": str(s.get("image") or "")[:80],
+                "image": _bounded_text(s.get("image"), 80, "沙盒镜像"),
             })
         elif kind in ("reviewer", "api"):
             if s.get("purpose") != "context":
@@ -326,8 +333,8 @@ def _clean_pipeline(steps) -> list:
                 raise HTTPException(400, "交叉评审组需要 1 至 20 个评审器")
             if any(not isinstance(m, dict) for m in members):
                 raise HTTPException(400, "评审器必须是对象")
-            clean.append({"id": str(s.get("id") or "cross-review")[:40], "kind": "review",
-                          "name": str(s.get("name") or "交叉评审")[:40],
+            clean.append({"id": _bounded_text(s.get("id") or "cross-review", 40, "评审组 ID"), "kind": "review",
+                          "name": _bounded_text(s.get("name") or "交叉评审", 40, "评审组名称"),
                           "enabled": bool(s.get("enabled", True)),
                           "reviewers": [_clean_model_node(m, "findings", f"reviewer{i}")
                                         for i, m in enumerate(members)]})
@@ -612,33 +619,48 @@ def list_marks(disposition: str = "", project_id: int | None = None, limit: int 
     if disposition not in ("", "confirmed", "false_positive"):
         disposition = ""
 
-    # 待处置：最近的 blocked run，枚举未标记的 Important
+    # 待处置：统计所有 blocked run；只返回前 50 条作工作台预览，不能把预览数冒充总数。
     conds, args = ["r.status='blocked'", "r.findings_json IS NOT NULL"], []
     if project_id:
         conds.append("p.id=?")
         args.append(project_id)
-    marked = {(m["run_id"], m["idx"]) for m in db.query("SELECT run_id, idx FROM finding_marks")}
-    pending = []
-    for r in db.query(
+    pending, pending_count, cursor = [], 0, None
+    while True:
+        page_conds = conds + (["r.id<?"] if cursor is not None else [])
+        page_args = args + ([cursor] if cursor is not None else [])
+        rows = db.query(
             "SELECT r.id AS run_id, r.project_id, r.created_at, r.findings_json, p.name AS project"
-            " FROM runs r JOIN projects p ON p.id=r.project_id WHERE " + " AND ".join(conds) +
-            " ORDER BY r.id DESC LIMIT 300", tuple(args)):
-        try:
-            findings = json.loads(r["findings_json"])
-        except Exception:
-            continue
-        for i, f in enumerate(findings):
-            if f.get("severity") != "IMPORTANT" or (r["run_id"], i) in marked:
-                continue
-            if any(str(s).startswith("gate:") for s in f.get("sources") or []):
-                continue
-            pending.append({
-                "run_id": r["run_id"], "idx": i, "project": r["project"],
-                "project_id": r["project_id"], "created_at": r["created_at"],
-                "file": f.get("file", ""), "line": f.get("line", 0),
-                "title": f.get("title", ""),
-            })
-    pending_count = len(pending)
+            " FROM runs r JOIN projects p ON p.id=r.project_id WHERE " + " AND ".join(page_conds) +
+            " ORDER BY r.id DESC LIMIT 200", tuple(page_args))
+        if not rows:
+            break
+        ids = [r["run_id"] for r in rows]
+        marked = {(m["run_id"], m["idx"]) for m in db.query(
+            "SELECT run_id,idx FROM finding_marks WHERE run_id IN (" + ",".join("?" for _ in ids) + ")",
+            tuple(ids))}
+        for r in rows:
+            try:
+                findings = json.loads(r["findings_json"])
+            except (TypeError, ValueError):
+                raise RuntimeError(f"审查 #{r['run_id']} 的发现数据无法解析，待办数量不可判定")
+            if not isinstance(findings, list) or any(not isinstance(f, dict) for f in findings):
+                raise RuntimeError(f"审查 #{r['run_id']} 的发现数据格式错误，待办数量不可判定")
+            for i, f in enumerate(findings):
+                if f.get("severity") != "IMPORTANT" or (r["run_id"], i) in marked:
+                    continue
+                if any(str(s).startswith("gate:") for s in f.get("sources") or []):
+                    continue
+                pending_count += 1
+                if len(pending) < 50:
+                    pending.append({
+                        "run_id": r["run_id"], "idx": i, "project": r["project"],
+                        "project_id": r["project_id"], "created_at": r["created_at"],
+                        "file": f.get("file", ""), "line": f.get("line", 0),
+                        "title": f.get("title", ""),
+                    })
+        cursor = rows[-1]["run_id"]
+        if len(rows) < 200:
+            break
 
     # 台账：已处置记录，可按处置类型 / 项目过滤
     conds, args = [], []
@@ -650,6 +672,10 @@ def list_marks(disposition: str = "", project_id: int | None = None, limit: int 
         args.append(project_id)
     w = (" WHERE " + " AND ".join(conds)) if conds else ""
     marks = []
+    marks_total = db.get(
+        "SELECT COUNT(*) c FROM finding_marks m"
+        " JOIN runs r ON r.id=m.run_id JOIN projects p ON p.id=r.project_id" + w,
+        tuple(args))["c"]
     for m in db.query(
             "SELECT m.run_id, m.idx, m.disposition, m.updated_at, p.name AS project, p.id AS project_id,"
             " r.findings_json FROM finding_marks m"
@@ -657,8 +683,8 @@ def list_marks(disposition: str = "", project_id: int | None = None, limit: int 
             " ORDER BY m.updated_at DESC, m.run_id DESC, m.idx DESC LIMIT ?", (*args, min(limit, 200))):
         try:
             f = json.loads(m["findings_json"])[m["idx"]]
-        except Exception:
-            f = {}
+        except (TypeError, ValueError, IndexError, KeyError) as exc:
+            raise RuntimeError(f"审查 #{m['run_id']} 的处置记录找不到原始发现，不能展示空记录") from exc
         marks.append({
             "run_id": m["run_id"], "idx": m["idx"],
             "project": m["project"], "project_id": m["project_id"],
@@ -680,7 +706,10 @@ def list_marks(disposition: str = "", project_id: int | None = None, limit: int 
     return {
         "stats": {"pending": pending_count, "total": st["total"],
                   "false_positive": st["fp"], "confirmed": st["cf"]},
-        "pending": pending[:50],
+        "pending": pending,
+        "pending_preview_limit": 50,
+        "marks_total": marks_total,
+        "marks_has_more": marks_total > len(marks),
         "marks": marks,
     }
 
@@ -780,7 +809,7 @@ def get_run(run_id: int):
     d["steps"] = [dict(s) for s in steps]
     d["findings"] = json.loads(run["findings_json"]) if run["findings_json"] else []
     d["has_diff"] = bool(run["diff_text"])
-    d.pop("diff_text", None)   # 完整 diff 走独立端点，避免轮询背负 200KB
+    d.pop("diff_text", None)   # diff 走独立端点，避免报告轮询背负大文件
     failure_events = [dict(e) for e in db.query(
         "SELECT action,note,created_at FROM run_failure_events WHERE run_id=? ORDER BY id DESC", (run_id,))]
     d["failure_history"] = failure_events
@@ -808,7 +837,7 @@ def triage_failed_run(run_id: int, body: FailureTriageIn):
         raise HTTPException(409, "只有执行失败的审查可以标记处理状态")
     if body.action not in ("handled", "reopen"):
         raise HTTPException(400, "action 只能是 handled 或 reopen")
-    note = body.note.strip()[:500]
+    note = _bounded_text(body.note.strip(), 500, "处理备注")
     latest = db.get("SELECT action,note FROM run_failure_events WHERE run_id=? ORDER BY id DESC LIMIT 1", (run_id,))
     if latest and latest["action"] == body.action and latest["note"] == note:
         return {"ok": True, "action": body.action, "unchanged": True}
@@ -819,10 +848,10 @@ def triage_failed_run(run_id: int, body: FailureTriageIn):
 
 @app.get("/api/runs/{run_id}/diff")
 def run_diff(run_id: int):
-    run = db.get("SELECT diff_text FROM runs WHERE id=?", (run_id,))
+    run = db.get("SELECT diff_text,diff_complete FROM runs WHERE id=?", (run_id,))
     if not run:
         raise HTTPException(404)
-    return {"diff": run["diff_text"] or ""}
+    return {"diff": run["diff_text"] or "", "complete": run["diff_complete"] == 1}
 
 
 class MarkIn(BaseModel):
@@ -848,7 +877,7 @@ def mark_finding(run_id: int, idx: int, body: MarkIn):
             "INSERT INTO finding_marks(run_id,idx,disposition,note,updated_at) VALUES(?,?,?,?,?)"
             " ON CONFLICT(run_id,idx) DO UPDATE SET disposition=excluded.disposition,"
             " note=excluded.note, updated_at=excluded.updated_at",
-            (run_id, idx, body.disposition, body.note.strip()[:500], db.now()))
+            (run_id, idx, body.disposition, _bounded_text(body.note.strip(), 500, "处置备注"), db.now()))
     return {"ok": True, "disposition": body.disposition}
 
 

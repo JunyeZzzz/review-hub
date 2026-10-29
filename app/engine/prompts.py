@@ -40,13 +40,8 @@ DEFAULT_TEMPLATE = """你是交叉评审组中的独立代码评审员。只根�
 
 def get_template() -> str:
     """初始提示词：DB 里存了用 DB 的（用户在配置中心改的），否则默认。"""
-    try:
-        saved = db.get_setting("prompt_template")
-        if saved:
-            return saved
-    except Exception:
-        pass
-    return DEFAULT_TEMPLATE
+    saved = db.get_setting("prompt_template")
+    return saved if saved else DEFAULT_TEMPLATE
 
 
 INIT_PROMPT = """根据下面的仓库信息，用**不超过 3 句中文**概括这个项目是做什么的：面向谁、解决什么问题、主要技术栈。
@@ -85,9 +80,11 @@ def build(workdir: Path, intent: str = "", profile: str = "", diff_spec: str = "
     if not diff.strip():
         raise RuntimeError("审查 diff 为空，不能判定通过")
     if any(line.startswith("Binary files ") or
-           line.startswith(("+Subproject commit ", "-Subproject commit "))
+           line.startswith(("+Subproject commit ", "-Subproject commit ")) or
+           line.startswith(("new file mode 120000", "deleted file mode 120000")) or
+           (line.startswith("index ") and line.endswith(" 120000"))
            for line in diff.splitlines()):
-        raise RuntimeError("变更包含二进制文件或子模块指针，文本 diff 无法展示完整内容；需要人工核验，不能自动判定通过")
+        raise RuntimeError("变更包含二进制文件、符号链接或子模块指针，文本审查无法完整核验；需要人工核验，不能自动判定通过")
     lines = diff.splitlines(keepends=True)
     parts = _review_parts(lines)
 

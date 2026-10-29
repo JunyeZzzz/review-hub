@@ -10,7 +10,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from app import config, connections, db, github, main, worker
-from app.engine import prompts
+from app.engine import gates, prompts
 
 
 class DefaultBranchWorkflowTest(unittest.TestCase):
@@ -104,6 +104,11 @@ class DefaultBranchWorkflowTest(unittest.TestCase):
         self.assertIn("second.txt", diff)
         self.assertIn("third.txt", diff)
         self.assertNotIn("first.txt", diff)
+        intent = worker._intent_for_range(repo, {"trigger": "push", "base_ref": before},
+                                          f"{before}..{after}", "third")
+        self.assertIn("second", intent)
+        self.assertIn("third", intent)
+        self.assertLess(intent.index("second"), intent.index("third"))
         root_base, root_head = worker._diff_range(
             repo, {"trigger": "push", "base_ref": "", "head_sha": before}, {})
         root_diff = prompts.build(repo, diff_spec=f"{root_base}..{root_head}")["diff_file"].read_text()
@@ -149,6 +154,47 @@ class DefaultBranchWorkflowTest(unittest.TestCase):
         after = git("rev-parse", "HEAD")
         with self.assertRaisesRegex(RuntimeError, "人工核验"):
             prompts.build(repo, diff_spec=f"{before}..{after}")
+
+    def test_old_report_diff_is_labeled_unknown_until_new_run_proves_complete(self):
+        rid = db.execute("INSERT INTO runs(project_id,trigger,diff_text,created_at) "
+                         "VALUES(?,'push','legacy diff',?)", (self.pid, db.now()))
+        self.assertFalse(main.run_diff(rid)["complete"])
+        db.execute("UPDATE runs SET diff_text=?,diff_complete=1 WHERE id=?", ("complete diff", rid))
+        self.assertEqual(main.run_diff(rid), {"diff": "complete diff", "complete": True})
+
+    def test_gate_mutations_do_not_reach_model_review(self):
+        repo = self.root / "mutable-repo"
+        repo.mkdir()
+        def git(*args):
+            return subprocess.run(["git", *args], cwd=repo, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git("init", "-b", "main")
+        (repo / "code.py").write_text("value = 1\n")
+        git("add", ".")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base")
+        (repo / "code.py").write_text("value = 2\n")
+        git("add", ".")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "change")
+        head = git("rev-parse", "HEAD")
+        pid = db.execute("INSERT INTO projects(kind,full_name,name,default_branch,created_at) "
+                         "VALUES('local',?,?,?,?)", (str(repo), "mutable-repo", "main", db.now()))
+        rid = worker.enqueue(pid, "manual", head_sha=head)
+        observed = []
+        def dirty_gate(workdir, **_kwargs):
+            (workdir / "code.py").write_text("value = 'tampered'\n")
+            (workdir / "generated.tmp").write_text("temporary")
+            return {"status": "ok", "cmd": "fake test", "log": "passed"}
+        def review(_step, _project, workdir, _built, _diff, _prior, _log):
+            observed.append(((workdir / "code.py").read_text(), (workdir / "generated.tmp").exists()))
+            return [("AI", '```json\n{"findings": []}\n```')]
+        pipeline = [{"kind": "gate", "gate": "tests", "name": "test"},
+                    {"kind": "review", "reviewers": [{"kind": "reviewer", "name": "AI"}]}]
+        with patch.object(worker, "get_pipeline", return_value=pipeline), \
+             patch.object(gates, "run_tests", side_effect=dirty_gate), \
+             patch.object(worker, "_run_review_group", side_effect=review):
+            worker.process_run(rid)
+        self.assertEqual(db.get("SELECT status FROM runs WHERE id=?", (rid,))["status"], "passed")
+        self.assertEqual(observed, [("value = 2\n", False)])
 
 
 if __name__ == "__main__":
