@@ -35,7 +35,7 @@ class ConnectivityChecksTest(unittest.TestCase):
         with patch.object(api_nodes, "run", return_value="OK") as runner:
             result = diagnostics.check_api(cid, "test-model")
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(runner.call_args.kwargs, {"timeout": 60, "max_tokens": 32})
+        self.assertEqual(runner.call_args.kwargs, {"timeout": 60, "max_tokens": 256})
         self.assertEqual(runner.call_args.args[0], {"credential_id": cid, "model": "test-model"})
         self.assertEqual(diagnostics.list_checks()[0]["model"], "test-model")
         main.rotate_model_credential(cid, {"key": "replacement-secret"})

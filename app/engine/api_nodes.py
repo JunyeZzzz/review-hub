@@ -134,5 +134,8 @@ def run(step: dict, prompt: str, *, timeout: int = 180, max_tokens: int = 4096) 
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         raise RuntimeError("模型 API 响应缺少可读取的文本") from exc
     if not text.strip():
+        finish_reason = (data.get("choices") or [{}])[0].get("finish_reason") if isinstance(data, dict) else None
+        if finish_reason == "length":
+            raise RuntimeError(f"模型已连接，但 {max_tokens} token 检测额度用尽，未得到最终文本")
         raise RuntimeError("模型 API 返回空文本")
     return text

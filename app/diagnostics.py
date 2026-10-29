@@ -82,7 +82,7 @@ def check_api(cid: int, model: str) -> dict:
     secret = connections._secret_path(credential["secret_ref"]).read_text(encoding="utf-8").strip()
     return _record(f"api:{cid}", model,
                    lambda: api_nodes.run({"credential_id": cid, "model": model}, _PROMPT,
-                                         timeout=60, max_tokens=32), [secret])
+                                         timeout=60, max_tokens=256), [secret])
 
 
 def check_agent(agent: str) -> dict:

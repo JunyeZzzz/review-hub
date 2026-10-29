@@ -151,8 +151,19 @@ class PipelineNodesTest(unittest.TestCase):
         self.assertNotIn("max_tokens", observed["body"])
         with patch.object(api_nodes.httpx, "Client", side_effect=lambda **kw: client_class(
                 transport=httpx.MockTransport(handler), **kw)):
-            api_nodes.run({"credential_id": cid, "model": "test-model"}, "short check", max_tokens=32)
-        self.assertEqual(observed["body"]["max_tokens"], 32)
+            api_nodes.run({"credential_id": cid, "model": "test-model"}, "short check", max_tokens=256)
+        self.assertEqual(observed["body"]["max_tokens"], 256)
+
+    def test_thinking_only_limited_response_explains_incomplete_probe(self):
+        cid = api_nodes.create("thinking", "moonshot", "test-key")
+        def handler(_request):
+            return httpx.Response(200, json={"choices": [{"finish_reason": "length", "message": {
+                "content": "", "reasoning_content": "thinking"}}]})
+        client_class = httpx.Client
+        with patch.object(api_nodes.httpx, "Client", side_effect=lambda **kw: client_class(
+                transport=httpx.MockTransport(handler), **kw)):
+            with self.assertRaisesRegex(RuntimeError, "检测额度用尽"):
+                api_nodes.run({"credential_id": cid, "model": "thinking-model"}, "check", max_tokens=256)
 
     def test_anthropic_api_node_uses_messages_protocol(self):
         cid = api_nodes.create("team-claude", "anthropic", "anthropic-secret")
