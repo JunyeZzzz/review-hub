@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import config, connections, db, evaluator, github, worker
+from . import config, connections, db, diagnostics, evaluator, github, worker
 from .engine import api_nodes, gates, prompts, reviewers
 
 app = FastAPI(title="Review Hub", docs_url=None, redoc_url=None)
@@ -123,6 +123,10 @@ def put_config(body: ConfigIn):
             continue   # 前端把掩码原样传回来了 -> 不改动
         db.set_setting(k, v)
         changed.append(k)
+    if any(k in changed for k in ("claude_token", "claude_model")):
+        db.execute("DELETE FROM connectivity_checks WHERE target='agent:claude'")
+    if any(k in changed for k in ("kimi_api_key", "kimi_model", "kimi_base_url")):
+        db.execute("DELETE FROM connectivity_checks WHERE target='agent:codex'")
     return {"ok": True, "changed": changed}
 
 
@@ -215,6 +219,31 @@ def model_credentials():
     return api_nodes.list_public()
 
 
+@app.get("/api/connectivity-checks")
+def connectivity_checks():
+    return diagnostics.list_checks()
+
+
+@app.post("/api/model-credentials/{cid}/check")
+def check_model_credential(cid: int, body: dict):
+    try:
+        return diagnostics.check_api(cid, str(body.get("model") or ""))
+    except diagnostics.CheckBusy as exc:
+        raise HTTPException(429, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/agents/{agent}/check")
+def check_agent(agent: str):
+    try:
+        return diagnostics.check_agent(agent)
+    except diagnostics.CheckBusy as exc:
+        raise HTTPException(429, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.post("/api/model-credentials")
 def create_model_credential(body: dict):
     try:
@@ -231,6 +260,7 @@ def rotate_model_credential(cid: int, body: dict):
         api_nodes.rotate(cid, str(body.get("key") or ""))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    db.execute("DELETE FROM connectivity_checks WHERE target=?", (f"api:{cid}",))
     return {"ok": True}
 
 
@@ -242,6 +272,7 @@ def update_model_credential(cid: int, body: dict):
     if "disabled" in body:
         db.execute("UPDATE model_credentials SET disabled=?,updated_at=? WHERE id=?",
                    (int(bool(body["disabled"])), db.now(), cid))
+        db.execute("DELETE FROM connectivity_checks WHERE target=?", (f"api:{cid}",))
     return {"ok": True}
 
 
@@ -260,6 +291,7 @@ def delete_model_credential(cid: int):
         api_nodes.delete(cid)
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
+    db.execute("DELETE FROM connectivity_checks WHERE target=?", (f"api:{cid}",))
     return {"ok": True}
 
 

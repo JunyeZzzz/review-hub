@@ -15,20 +15,6 @@ if [ ! -d .venv ]; then
   ./.venv/bin/pip install -q --upgrade pip
   ./.venv/bin/pip install -q -r requirements.txt
 fi
-# 读取 .env（供 codex 桥接配置生成使用）
+# 读取 .env；Codex 的运行配置由服务按当前设置生成
 if [ -f .env ]; then set -a; source .env; set +a; fi
-# 生成 hub 专属 codex 配置（Kimi 后端，Responses API；不影响全局 ~/.codex）
-if [ -n "${KIMI_API_KEY:-}" ]; then
-  mkdir -p data/codex-home
-  cat > data/codex-home/config.toml <<TOML
-model_provider = "kimi"
-model = "${KIMI_MODEL:-kimi-k2.7-code}"
-
-[model_providers.kimi]
-name = "Kimi"
-base_url = "${KIMI_BASE_URL:-https://api.moonshot.cn/v1}"
-env_key = "KIMI_API_KEY"
-wire_api = "responses"
-TOML
-fi
 exec ./.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port "${HUB_PORT:-7777}"

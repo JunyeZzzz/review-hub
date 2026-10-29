@@ -1884,6 +1884,17 @@ function cfgBadge(set) {
   return set ? `<span class="badge">已配置</span>` : `<span class="badge imp">未配置</span>`;
 }
 
+function checkStatusHtml(check) {
+  if (!check) return '<span class="muted">未检测</span>';
+  const expired = Date.now() - Date.parse(check.checked_at) > 10 * 60 * 1000;
+  const stale = check.stale || expired;
+  const label = stale ? "结果已过期" : check.status === "ok" ? "可用" : "检测失败";
+  const badge = stale ? "mock" : check.status === "ok" ? "confirmed" : "imp";
+  const cost = Number.isFinite(check.latency_ms) ? ` · ${(check.latency_ms / 1000).toFixed(1)}s` : "";
+  return `<span class="badge ${badge}">${label}</span> <span class="muted">${fmtTime(check.checked_at)}${cost}</span>
+    ${check.detail ? `<span class="check-detail" title="${esc(check.detail)}">${esc(check.detail)}</span>` : ""}`;
+}
+
 const SETTINGS_TABS = [
   ["pipeline", "流水线编排"],
   ["engine", "评审引擎"],
@@ -2185,10 +2196,19 @@ async function renderSettings(tab = "pipeline") {
 
   // 凭证与模型
   const v = cfg.values;
-  let conns, modelCreds, providers;
-  try { [conns, modelCreds, providers] = await Promise.all([
-    api("/api/github-connections"), api("/api/model-credentials"), api("/api/model-providers")]); }
+  let conns, modelCreds, providers, checks;
+  try { [conns, modelCreds, providers, checks] = await Promise.all([
+    api("/api/github-connections"), api("/api/model-credentials"), api("/api/model-providers"),
+    api("/api/connectivity-checks")]); }
   catch (e) { errorPanel(e.message); return; }
+  const checkMap = new Map(checks.map((c) => [c.target, c]));
+  const modelByCredential = new Map();
+  for (const step of pipe.steps || []) {
+    for (const item of [step, ...(step.reviewers || [])]) {
+      if (item.kind === "api" && item.credential_id && item.model && !modelByCredential.has(item.credential_id))
+        modelByCredential.set(item.credential_id, item.model);
+    }
+  }
   $app.innerHTML = `
   ${pageHead({ title: "凭证与模型", sub: "存库即生效，无需重启" })}
   ${tabsHtml(tab)}
@@ -2209,10 +2229,14 @@ async function renderSettings(tab = "pipeline") {
   <div class="sec-title">模型 API 凭证 <span class="faint small">一个服务商可保存多组；节点按 ID 绑定</span></div>
   <div class="panel model-credentials" style="padding:18px 20px;margin-bottom:18px">
     ${modelCreds.length ? `<div class="model-credential-list">${modelCreds.map((c) => `<div class="model-credential-row">
-      <div><strong>${esc(c.label)}</strong><small>${esc(providers.find((p) => p.id === c.provider)?.label || c.provider)} · ${esc(c.base_url)}${c.disabled ? " · 已停用" : ""}</small></div>
-      <div class="actions"><button class="ghost small-btn" data-mc-rotate="${c.id}">更换 Key</button>
+      <div class="mc-identity"><strong>${esc(c.label)}</strong><small>${esc(providers.find((p) => p.id === c.provider)?.label || c.provider)} · ${esc(c.base_url)}${c.disabled ? " · 已停用" : ""}</small></div>
+      <div class="mc-controls"><div class="actions"><button class="ghost small-btn" data-mc-rotate="${c.id}">更换 Key</button>
         <button class="ghost small-btn" data-mc-toggle="${c.id}" data-disabled="${c.disabled}">${c.disabled ? "启用" : "停用"}</button>
-        <button class="danger-ghost small-btn" data-mc-delete="${c.id}">删除</button></div></div>`).join("")}</div>`
+        <button class="danger-ghost small-btn" data-mc-delete="${c.id}">删除</button></div>
+        <div class="check-line"><input aria-label="${esc(c.label)} 检测模型 ID" data-mc-model="${c.id}" maxlength="100"
+          value="${esc(modelByCredential.get(c.id) || checkMap.get(`api:${c.id}`)?.model || "")}" placeholder="检测模型 ID">
+          <button class="ghost small-btn" data-mc-check="${c.id}" ${c.disabled ? "disabled" : ""}>检测 API</button></div>
+        <div class="check-status" data-check-status="api:${c.id}">${checkStatusHtml(checkMap.get(`api:${c.id}`))}</div></div></div>`).join("")}</div>`
       : '<p class="hint">还没有 API 凭证。添加后可在流水线中选择“模型 API”节点。</p>'}
     <div class="model-credential-add"><div class="form-row">
       <div class="field"><label>连接名称</label><input id="mc-label" placeholder="例如：团队 OpenAI / 预算 A"></div>
@@ -2221,6 +2245,13 @@ async function renderSettings(tab = "pipeline") {
       <div class="field"><label>Base URL</label><input id="mc-url" placeholder="HTTPS API Base URL"></div></div>
       <button class="primary small-btn" id="mc-save">添加模型凭证</button>
       <span class="hint">模型 ID 在每个节点的配置弹窗填写；请求失败会在审查报告记录状态。</span></div>
+  </div>
+  <div class="sec-title">Agent CLI 连通性 <span class="faint small">运行短任务，验证命令、认证与模型响应</span></div>
+  <div class="agent-check-grid">
+    ${[["claude", "Claude Code", s.claude_cli], ["codex", "Kimi / Codex CLI", s.codex_cli]].map(([key, label, installed]) => `
+      <div class="panel agent-check-card"><div><strong>${label}</strong><span class="badge ${installed ? "confirmed" : "imp"}">${installed ? "命令存在" : "命令缺失"}</span></div>
+        <div class="check-status" data-check-status="agent:${key}">${checkStatusHtml(checkMap.get(`agent:${key}`))}</div>
+        <button class="ghost small-btn" data-agent-check="${key}" ${installed ? "" : "disabled"}>检测 Agent CLI</button></div>`).join("")}
   </div>
   <div class="sec-title">现有 Agent CLI 凭证与默认模型</div>
   <div class="panel stagger" style="padding:18px 20px">
@@ -2313,6 +2344,28 @@ async function renderSettings(tab = "pipeline") {
       toast("模型凭证已删除"); renderSettings("creds"); }
     catch (e) { toast(e.message, true); }
   });
+  const runCheck = async (button, target, path, body = null) => {
+    const status = document.querySelector(`[data-check-status="${target}"]`);
+    button.disabled = true;
+    button.textContent = "检测中…";
+    if (status) status.innerHTML = '<span class="badge mock">检测中</span> <span class="muted">最长等待 60 秒</span>';
+    try {
+      const result = await api(path, { method: "POST", ...(body ? { body } : {}) });
+      if (status?.isConnected) status.innerHTML = checkStatusHtml(result);
+    } catch (e) {
+      if (status?.isConnected) status.innerHTML = `<span class="badge imp">请求失败</span> ${esc(e.message)}`;
+    } finally {
+      if (button.isConnected) { button.disabled = false; button.textContent = target.startsWith("api:") ? "检测 API" : "检测 Agent CLI"; }
+    }
+  };
+  document.querySelectorAll("[data-mc-check]").forEach((b) => b.onclick = () => {
+    const id = b.dataset.mcCheck;
+    const model = document.querySelector(`[data-mc-model="${id}"]`)?.value.trim();
+    if (!model) { toast("请先填写要检测的模型 ID", true); return; }
+    runCheck(b, `api:${id}`, `/api/model-credentials/${id}/check`, { model });
+  });
+  document.querySelectorAll("[data-agent-check]").forEach((b) => b.onclick = () =>
+    runCheck(b, `agent:${b.dataset.agentCheck}`, `/api/agents/${b.dataset.agentCheck}/check`));
   $("cfg-save").onclick = async () => {
     const values = {};
     for (const k of EDITABLE_KEYS) {

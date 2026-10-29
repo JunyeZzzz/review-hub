@@ -77,6 +77,14 @@ CREATE TABLE IF NOT EXISTS model_credentials (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS connectivity_checks (
+  target TEXT PRIMARY KEY,            -- api:<id> | agent:claude | agent:codex
+  status TEXT NOT NULL,                -- ok | failed
+  detail TEXT NOT NULL DEFAULT '',
+  latency_ms INTEGER NOT NULL,
+  checked_at TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS finding_marks (
   run_id INTEGER NOT NULL,
   idx INTEGER NOT NULL,                  -- findings_json 数组下标（run 结束后不再变化）

@@ -474,6 +474,17 @@ tr.rowlink:hover .goto-hint { color: var(--accent); }
 .provider-choice { grid-template-columns:repeat(2,minmax(0,1fr)); max-height:180px; overflow:auto; padding:2px; }
 .model-credential-list { margin:5px 0; }
 .model-credential-row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:11px 0; border-bottom:1px solid var(--line); }
+.model-credential-row .mc-identity { min-width:0; flex:1; }
+.model-credential-row .mc-controls { display:grid; justify-items:end; gap:6px; min-width:310px; }
+.check-line { display:flex; gap:6px; align-items:center; }
+.check-line input { width:170px; min-height:30px; font-size:11px; }
+.check-status { font-size:11px; line-height:1.5; color:var(--muted); }
+.check-detail { display:block; max-width:440px; overflow-wrap:anywhere; }
+.agent-check-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-bottom:18px; }
+.agent-check-card { padding:14px 18px; display:grid; gap:9px; align-content:start; }
+.agent-check-card > div:first-child { display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+.agent-check-card strong { font-size:12px; }
+.agent-check-card button { justify-self:start; }
 .model-credential-row strong, .model-credential-row small { display:block; }
 .model-credential-row strong { font-size:12px; }
 .model-credential-row small { font-size:11px; color:var(--muted); overflow-wrap:anywhere; }
@@ -768,6 +779,8 @@ body.nav-anim .stagger > *:nth-child(5) { animation-delay: .24s; }
   .node-actions { width:100%; justify-content:flex-end; flex-wrap:wrap; }
   .review-scroll-hint { display:block; }
   .model-credential-row { display:block; }
+  .model-credential-row .mc-controls { justify-items:start; min-width:0; margin-top:8px; }
+  .agent-check-grid { grid-template-columns:1fr; }
   .model-credential-row .actions { margin-top:7px; flex-wrap:wrap; }
   .model-credential-add .hint { display:block; margin:8px 0 0; }
 }

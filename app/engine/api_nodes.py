@@ -89,7 +89,7 @@ def get_active(cid: int) -> dict:
     return dict(row)
 
 
-def run(step: dict, prompt: str) -> str:
+def run(step: dict, prompt: str, *, timeout: int = 180, max_tokens: int = 4096) -> str:
     credential = get_active(int(step["credential_id"]))
     key = connections._secret_path(credential["secret_ref"]).read_text(encoding="utf-8").strip()
     if not key:
@@ -101,7 +101,7 @@ def run(step: dict, prompt: str) -> str:
     if credential["provider"] == "anthropic":
         url = base + "/messages"
         headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
-        payload = {"model": model, "max_tokens": 4096,
+        payload = {"model": model, "max_tokens": max_tokens,
                    "messages": [{"role": "user", "content": prompt}]}
     else:
         url = base + "/chat/completions"
@@ -110,7 +110,7 @@ def run(step: dict, prompt: str) -> str:
         if credential["provider"] == "gemini":
             headers["x-goog-api-client"] = "review-hub/1.0"
     try:
-        with httpx.Client(timeout=180, follow_redirects=False) as client:
+        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
             with client.stream("POST", url, headers=headers, json=payload) as response:
                 raw = bytearray()
                 for chunk in response.iter_bytes():

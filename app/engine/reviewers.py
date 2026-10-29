@@ -6,10 +6,12 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from .. import config
 from ..processes import run_grouped
+from .api_nodes import validate_base_url
 
 
 class ReviewerError(RuntimeError):
@@ -41,6 +43,21 @@ def claude_ready() -> bool:
 def codex_ready() -> bool:
     """Kimi key 驱动的 codex（走 hub 专属 CODEX_HOME 配置）。"""
     return codex_available() and bool(config.get_kimi_api_key())
+
+
+def _sync_codex_config() -> None:
+    """按当前数据库配置原子更新 Hub 专属 Codex Home，检测与评审共用。"""
+    home = config.CODEX_HOME
+    home.mkdir(parents=True, exist_ok=True)
+    base = validate_base_url("moonshot", config.get_kimi_base_url())
+    body = (f'model_provider = "kimi"\nmodel = {json.dumps(config.get_kimi_model())}\n\n'
+            '[model_providers.kimi]\nname = "Kimi"\n'
+            f'base_url = {json.dumps(base)}\nenv_key = "KIMI_API_KEY"\nwire_api = "responses"\n')
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=home,
+                                     prefix=".config-", delete=False) as tmp:
+        tmp.write(body)
+        temp_path = Path(tmp.name)
+    temp_path.replace(home / "config.toml")
 
 
 def _parse_claude_stream(raw: str):
@@ -122,18 +139,19 @@ def _parse_codex_stream(raw: str):
     return "\n".join(finals), trace
 
 
-def run_claude(workdir: Path, prompt_file: Path, model: str = ""):
+def run_claude(workdir: Path, prompt_file: Path, model: str = "", *,
+               timeout: int = 900, max_turns: int = 40, allowed_tools: str = "Read,Grep,Glob"):
     if not claude_available():
         raise ReviewerError(
             f"claude CLI 未找到（启动时的 PATH={os.environ.get('PATH', '')[:300]}）；"
             "请确认 npm -g 安装位置在 PATH 里，然后重启 hub")
     cmd = [config.CLAUDE_BIN, "-p", prompt_file.read_text(encoding="utf-8"),
            "--output-format", "stream-json", "--verbose",
-           "--allowedTools", "Read,Grep,Glob", "--max-turns", "40"]
+           "--allowedTools", allowed_tools, "--max-turns", str(max_turns)]
     model = model or config.get_claude_model()
     if model:
         cmd += ["--model", model]
-    r = run_grouped(cmd, cwd=workdir, env=_subprocess_env(), timeout=900,
+    r = run_grouped(cmd, cwd=workdir, env=_subprocess_env(), timeout=timeout,
                     stdin=subprocess.DEVNULL)
     if r.returncode != 0:
         raise ReviewerError(f"claude 退出码 {r.returncode}：{(r.stderr or r.stdout)[-500:]}")
@@ -143,21 +161,25 @@ def run_claude(workdir: Path, prompt_file: Path, model: str = ""):
     return text, trace
 
 
-def run_codex(workdir: Path, prompt_file: Path, model: str = ""):
+def run_codex(workdir: Path, prompt_file: Path, model: str = "", *,
+              timeout: int = 900, skip_git_check: bool = False):
     if not codex_available():
         raise ReviewerError(
             f"codex CLI 未找到（启动时的 PATH={os.environ.get('PATH', '')[:300]}）")
     if not config.get_kimi_api_key():
         raise ReviewerError("缺少 Kimi API Key（配置中心或 .env）——Codex 侧评审由 Kimi 驱动")
+    _sync_codex_config()
     env = _subprocess_env()
     env["CODEX_HOME"] = str(config.CODEX_HOME)
     env["KIMI_API_KEY"] = config.get_kimi_api_key()
     cmd = [config.CODEX_BIN, "exec", "--sandbox", "read-only", "--json",
            prompt_file.read_text(encoding="utf-8")]
+    if skip_git_check:
+        cmd.insert(-1, "--skip-git-repo-check")
     model = model or config.get_kimi_model()
     if model:
         cmd = cmd[:1] + ["--model", model] + cmd[1:]
-    r = run_grouped(cmd, cwd=workdir, env=env, timeout=900, stdin=subprocess.DEVNULL)
+    r = run_grouped(cmd, cwd=workdir, env=env, timeout=timeout, stdin=subprocess.DEVNULL)
     if r.returncode != 0:
         raise ReviewerError(f"codex 退出码 {r.returncode}：{(r.stderr or r.stdout)[-500:]}")
     text, trace = _parse_codex_stream(r.stdout)
