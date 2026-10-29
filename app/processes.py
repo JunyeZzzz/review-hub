@@ -59,7 +59,8 @@ def run_grouped(cmd: list[str], *, cwd: str | Path, env: dict,
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _stop_group(proc)
-                raise subprocess.TimeoutExpired(cmd, timeout)
+                # Agent 的命令参数可能含完整源码提示词，异常不可回显它们。
+                raise subprocess.TimeoutExpired(cmd[:1], timeout)
             time.sleep(min(0.05, remaining))
         try:
             os.killpg(proc.pid, 0)

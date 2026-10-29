@@ -87,6 +87,14 @@ class GateIntegrityTest(unittest.TestCase):
         time.sleep(1)
         self.assertFalse(marker.exists())
 
+    def test_timeout_error_does_not_echo_prompt_arguments(self):
+        marker = "PRIVATE_REVIEW_PROMPT_MARKER"
+        with self.assertRaises(subprocess.TimeoutExpired) as raised:
+            processes.run_grouped([sys.executable, "-c", "import time; time.sleep(2)", marker],
+                                  cwd=self.root, env=os.environ.copy(), timeout=0.05)
+        self.assertNotIn(marker, str(raised.exception))
+        self.assertEqual(raised.exception.cmd, [sys.executable])
+
     def test_gate_cannot_pass_with_detached_background_child(self):
         marker = self.root / "background.txt"
         child = f"import time,pathlib; time.sleep(0.8); pathlib.Path({str(marker)!r}).write_text('late')"
