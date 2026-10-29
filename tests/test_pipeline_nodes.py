@@ -1,7 +1,9 @@
 """节点编排、上下文和模型 API 凭证的边界测试。"""
 import json
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -242,6 +244,64 @@ class PipelineNodesTest(unittest.TestCase):
         self.assertEqual(seen[0][1], prior)
         self.assertEqual(seen[1][1], prior)
         self.assertEqual(len(prior), 1)
+
+    def test_cross_review_runs_in_parallel_and_records_each_result(self):
+        group = {"kind": "review", "reviewers": [
+            {"id": "a", "name": "A"}, {"id": "b", "name": "B"}]}
+        barrier = threading.Barrier(2, timeout=3)
+        b_done = threading.Event()
+        def execute(step, *_args):
+            barrier.wait()
+            if step["name"] == "A":
+                self.assertTrue(b_done.wait(3))
+            else:
+                b_done.set()
+            return f'```json\n{{"findings": []}}\n```\n{step["name"]}', None, "prompt"
+        with patch.object(worker, "_run_reviewer_step", side_effect=execute):
+            outputs = worker._run_review_group(group, {}, self.root, {}, "", [], worker.StepLog(77))
+        self.assertEqual([name for name, _ in outputs], ["A", "B"])
+        rows = db.query("SELECT idx,name,status,log FROM steps WHERE run_id=77 ORDER BY idx")
+        self.assertEqual([(r["idx"], r["name"], r["status"]) for r in rows],
+                         [(0, "A", "ok"), (1, "B", "ok")])
+        self.assertIn("A", rows[0]["log"])
+        self.assertIn("B", rows[1]["log"])
+
+    def test_cross_review_waits_for_all_and_fails_if_one_member_fails(self):
+        group = {"kind": "review", "reviewers": [
+            {"id": "a", "name": "A"}, {"id": "b", "name": "B"}]}
+        barrier = threading.Barrier(2, timeout=3)
+        def execute(step, *_args):
+            barrier.wait()
+            if step["name"] == "A":
+                raise RuntimeError("provider unavailable")
+            return '```json\n{"findings": []}\n```', None, "prompt"
+        with patch.object(worker, "_run_reviewer_step", side_effect=execute):
+            with self.assertRaisesRegex(RuntimeError, "provider unavailable"):
+                worker._run_review_group(group, {}, self.root, {}, "", [], worker.StepLog(78))
+        rows = db.query("SELECT name,status FROM steps WHERE run_id=78 ORDER BY idx")
+        self.assertEqual([(r["name"], r["status"]) for r in rows], [("A", "fail"), ("B", "ok")])
+
+    def test_parallel_agent_prompts_use_distinct_files(self):
+        prompt = self.root / "prompt.txt"
+        prompt.write_text("基础评审指令", encoding="utf-8")
+        diff = self.root / "diff.patch"
+        diff.write_text("diff --git a/x b/x", encoding="utf-8")
+        built = {"prompt_file": prompt, "diff_file": diff}
+        barrier = threading.Barrier(2, timeout=3)
+        observed = []
+        def fake_claude(_workdir, prompt_file, _model):
+            barrier.wait()
+            observed.append((prompt_file, prompt_file.read_text(encoding="utf-8")))
+            return '```json\n{"findings": []}\n```', None
+        with patch.object(worker.reviewers, "run_claude", side_effect=fake_claude):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(worker._run_reviewer_step,
+                                       {"provider": "claude", "prompt": name}, {},
+                                       self.root, built, "", []) for name in ("A", "B")]
+                for future in futures:
+                    future.result()
+        self.assertEqual(len({path for path, _ in observed}), 2)
+        self.assertEqual({"A", "B"}, {"A" if "侧重点\nA" in text else "B" for _, text in observed})
 
     def test_reordering_reviewers_does_not_change_verdict_or_eval_fingerprint(self):
         a = ('A', '```json\n{"findings":[{"severity":"Important","file":"x.py","line":10,"title":"空指针错误"}]}\n```')

@@ -18,6 +18,7 @@
 - 机械门禁：**测试门禁**（make test / npm test / pytest / go test）与**构建门禁**（npm run build / make build / go build），**红灯即阻断**且不再执行后续 AI 评审；没有对应入口会明确记 skip，已有入口但执行工具缺失会阻断；**安全门禁**（semgrep）扫描全部现存变更文件，ERROR 级发现一票否决
 - **本机并发门禁**：不同项目使用不同 Git 工作目录；每条测试、构建和本机安全扫描命令使用独立 `HOME`、临时目录和工具缓存，超时清理该命令进程组。Docker 不再是默认依赖。门禁后恢复原提交，模型只读取被审代码。本机命令仍以服务账户的文件权限运行，仅接入可信仓库；需要更强权限隔离时用专用低权限账户或可选 Docker
 - 并发 worker（`WORKER_CONCURRENCY`，默认 2）：**不同项目并行审查、同一项目自动串行**（共享克隆目录不互踩），原子认领不重复消费
+- 组内并行评审（`REVIEW_CONCURRENCY`，默认及上限 4）：各评审器同时读取相同的上游上下文，独立记录结果；全部完成后按配置顺序汇总，任一成员失败则整组失败
 - 固定前置：风险路由（trivial/low/medium/high）→ 密钥扫描；固定收尾：交叉裁决
 - 双模型交叉评审：**Claude（本机 CLI）× Kimi（Moonshot，经 codex CLI 桥接）**，不同模型家族盲区不相关；评审器只读（Read/Grep/Glob、codex read-only 沙盒），不执行被审代码
 - 裁决规则：≥2 个评审者报出相似发现 → Important（交叉确认）；单来源 → Nit；只启用一个评审者时按原始严重度不降级
@@ -72,6 +73,7 @@
 | `HUB_ADMIN_USER` / `HUB_ADMIN_PASSWORD` | 公网管理界面的 HTTP Basic 凭据 |
 | `POLL_INTERVAL` | 轮询间隔秒数，默认 30 |
 | `WORKER_CONCURRENCY` | 并发审查 worker 数，默认 2 |
+| `REVIEW_CONCURRENCY` | 每组并发评审器数，默认及上限 4；跨项目同时运行的评审器最多约为两项并发数之积 |
 | `HUB_BACKGROUND` | 默认为 1；测试或仅 API 副本设为 0 |
 
 **工作台与下钻**

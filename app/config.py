@@ -48,6 +48,8 @@ PORT = int(os.environ.get("HUB_PORT", "7777"))
 
 # 并发审查 worker 数：不同项目工作目录分开；本机命令仍共享系统资源和用户权限。
 WORKER_CONCURRENCY = max(1, int(os.environ.get("WORKER_CONCURRENCY", "2")))
+# 每次交叉评审最多同时启动的 Agent/API 数；与跨项目 worker 并发相乘。
+REVIEW_CONCURRENCY = min(4, max(1, int(os.environ.get("REVIEW_CONCURRENCY", "4"))))
 
 # CLI 绝对路径：启动时解析一次，避免运行期 PATH 漂移导致"时有时无"
 import shutil as _shutil  # noqa: E402

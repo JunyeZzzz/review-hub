@@ -1,6 +1,7 @@
 """失败待办状态与评测进度的可恢复边界。"""
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -82,7 +83,8 @@ class WorkbenchQualityTest(unittest.TestCase):
             result = evaluator._run_case(case, lambda stage, trace: seen.append(stage))
         self.assertEqual(result["result"], "hit")
         self.assertIn("检出原提交", seen)
-        self.assertIn("独立评审 · A", seen)
+        self.assertIn("并行交叉评审", seen)
+        self.assertIn({"name": "独立评审 · A", "status": "ok"}, result["steps"])
         self.assertEqual(result["steps"][-1], {"name": "与人工答案比对", "status": "ok"})
         self.assertEqual(result["actual"][0]["title"], "空指针错误")
 
@@ -105,6 +107,31 @@ class WorkbenchQualityTest(unittest.TestCase):
             result = evaluator._run_case(case)
         self.assertEqual(observed, ["oldsha..newsha"])
         self.assertEqual(result["result"], "error")  # 没有评审器，不可误判为通过
+
+    def test_eval_review_members_run_in_parallel_and_keep_trace(self):
+        source_run = db.execute(
+            "INSERT INTO runs(project_id,trigger,base_ref,head_sha,created_at) VALUES(?,'push','base','head',?)",
+            (self.pid, db.now()))
+        case = {"id": 1, "project_id": self.pid, "run_id": source_run, "head_sha": "head",
+                "intent": "", "polarity": "positive",
+                "expected": json.dumps({"file": "x.py", "line": 10, "title": "空指针错误"})}
+        diff = self.root / "diff.patch"
+        diff.write_text("+++ b/x.py\n+value = 1")
+        pipeline = [{"kind": "review", "reviewers": [{"name": "A"}, {"name": "B"}]}]
+        barrier = threading.Barrier(2, timeout=3)
+        def review(step, *_args):
+            barrier.wait()
+            return ('```json\n{"findings":[{"severity":"Important","file":"x.py",'
+                    '"line":10,"title":"空指针错误"}]}\n```', None, "prompt")
+        with patch.object(worker, "_ensure_clone"), patch.object(worker, "_git_retry"), \
+             patch.object(worker, "get_pipeline", return_value=pipeline), \
+             patch.object(prompts, "build", return_value={"diff_file": diff}), \
+             patch.object(worker, "_run_reviewer_step", side_effect=review):
+            result = evaluator._run_case(case)
+        self.assertEqual(result["result"], "hit")
+        self.assertIn({"name": "并行交叉评审", "status": "ok"}, result["steps"])
+        self.assertIn({"name": "独立评审 · A", "status": "ok"}, result["steps"])
+        self.assertIn({"name": "独立评审 · B", "status": "ok"}, result["steps"])
 
     def test_eval_progress_persists_and_interrupted_run_is_visible(self):
         rid = db.execute("INSERT INTO eval_runs(status,cases_total,config_snapshot,created_at) VALUES('running',1,?,?)",

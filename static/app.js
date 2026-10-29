@@ -2552,7 +2552,7 @@ function pipeListHTML(draft) {
     ${draft.map((s, i) => {
       if (s.kind === "review") return `<div class="node-flow-item"><div class="review-stage">
         <div class="review-stage-head"><div><span class="node-kind review">交叉评审</span><strong>${esc(s.name || "交叉评审")}</strong>
-          <small>各评审器拿到同一份上游上下文；排列只决定执行顺序，不传递彼此的结论</small></div>
+          <small>评审器并行读取同一份上游上下文；超出并发上限时按排列分批，不传递彼此的结论</small></div>
           <button class="ghost small-btn" data-member-add>+ 添加评审器</button></div>
         <span class="review-scroll-hint">左右滑动查看评审器 →</span><div class="review-members">${(s.reviewers || []).map((m, j) => {
           const cred = nodeCredentials.find((c) => c.id === m.credential_id);
@@ -2561,8 +2561,8 @@ function pipeListHTML(draft) {
           return `<div class="review-member ${m.enabled ? "" : "off"}"><div class="review-member-top"><span class="node-kind ${m.kind}">${NODE_KIND[m.kind]}</span><span class="mono small muted">${j + 1}</span></div>
             <strong>${esc(m.name || "未命名评审器")}</strong><small>${detail}</small>
             <div class="review-member-actions"><label title="启用 / 停用"><input type="checkbox" data-member-en="${j}" ${m.enabled ? "checked" : ""}></label>
-              <button class="ghost small-btn" data-member-left="${j}" ${j ? "" : "disabled"} title="提前执行">←</button>
-              <button class="ghost small-btn" data-member-right="${j}" ${j < s.reviewers.length - 1 ? "" : "disabled"} title="稍后执行">→</button>
+              <button class="ghost small-btn" data-member-left="${j}" ${j ? "" : "disabled"} title="前移排列">←</button>
+              <button class="ghost small-btn" data-member-right="${j}" ${j < s.reviewers.length - 1 ? "" : "disabled"} title="后移排列">→</button>
               <button class="ghost small-btn" data-member-edit="${j}">配置</button>
               <button class="danger-ghost small-btn" data-member-del="${j}">删除</button></div></div>`;
         }).join("")}</div></div></div>`;

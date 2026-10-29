@@ -8,6 +8,8 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from . import config, connections, db, github
@@ -145,7 +147,7 @@ def _run_reviewer_step(step: dict, project: dict, workdir: Path,
         findings, traces, inputs, summaries = [], [], [], []
         total = len(built["review_parts"])
         for index, path in enumerate(built["review_parts"], 1):
-            part_prompt = workdir / f".hub-prompt-part-{index}.txt"
+            part_prompt = workdir / f".hub-prompt-part-{index}-{uuid.uuid4().hex}.txt"
             part_prompt.write_text(template.replace(full_path, str(path)) +
                                    f"\n## 分片审查 {index}/{total}\n"
                                    "这只是完整变更的一部分。请逐行检查本片段；需要时读取仓库其他文件验证。"
@@ -179,7 +181,7 @@ def _run_reviewer_step(step: dict, project: dict, workdir: Path,
             raise RuntimeError(f"节点输出超过 {MAX_NODE_OUTPUT_CHARS} 字符上限")
         return text, None, prompt_text
     provider = step.get("provider", "claude")
-    prompt_file = workdir / f".hub-node-{len(prior)}.txt"
+    prompt_file = workdir / f".hub-node-{uuid.uuid4().hex}.txt"
     prompt_file.write_text(prompt_text, encoding="utf-8")
     if provider == "claude":
         text, trace = reviewers.run_claude(workdir, prompt_file, step.get("model") or "")
@@ -194,24 +196,40 @@ def _run_reviewer_step(step: dict, project: dict, workdir: Path,
 
 def _run_review_group(group: dict, project: dict, workdir: Path, built: dict,
                       diff_text: str, prior: list[dict], sl: "StepLog") -> list[tuple[str, str]]:
-    """组内各成员使用同一份上游上下文；其输出只汇入组后的裁决。"""
-    outs = []
-    for member in group.get("reviewers", []):
-        if not member.get("enabled", True):
-            continue
-        name = member.get("name") or member.get("id", "评审")
-        t0 = sl.start(name)
-        try:
-            text, trace, prompt_text = _run_reviewer_step(
-                member, project, workdir, built, diff_text, prior)
-            if verdict.extract_findings(text) is None:
-                raise RuntimeError("评审器未返回有效 findings JSON，不能判定通过")
-            sl.finish(t0, "ok", log=text, trace=trace, prompt=prompt_text)
-            outs.append((name, text))
-        except Exception as e:
-            sl.finish(t0, "fail", str(e))
-            raise
-    return outs
+    """成员并行读取同一份上游输入；结束后按配置顺序汇总，任一失败整组失败。"""
+    members = [m for m in group.get("reviewers", []) if m.get("enabled", True)]
+    if not members:
+        return []
+    outputs = [None] * len(members)
+    errors = []
+    # 分批启动，使排队中的成员仍是未开始，而非报告里的 running。
+    for offset in range(0, len(members), config.REVIEW_CONCURRENCY):
+        batch = members[offset:offset + config.REVIEW_CONCURRENCY]
+        slots = []
+        for member in batch:
+            name = member.get("name") or member.get("id", "评审")
+            t0 = sl.start(name)
+            slots.append((member, name, t0, getattr(sl, "step_id", None)))
+        with ThreadPoolExecutor(max_workers=len(slots), thread_name_prefix="hub-review") as pool:
+            futures = {pool.submit(_run_reviewer_step, member, project, workdir,
+                                   built, diff_text, [dict(item) for item in prior]): i
+                       for i, (member, _, _, _) in enumerate(slots)}
+            for future in as_completed(futures):
+                i = futures[future]
+                _, name, t0, step_id = slots[i]
+                try:
+                    text, trace, prompt_text = future.result()
+                    if verdict.extract_findings(text) is None:
+                        raise RuntimeError("评审器未返回有效 findings JSON，不能判定通过")
+                except Exception as exc:
+                    sl.finish(t0, "fail", str(exc), step_id=step_id)
+                    errors.append(f"{name}: {exc}")
+                else:
+                    sl.finish(t0, "ok", log=text, trace=trace, prompt=prompt_text, step_id=step_id)
+                    outputs[offset + i] = (name, text)
+    if errors:
+        raise RuntimeError("交叉评审有成员失败；" + "；".join(errors))
+    return outputs
 
 
 def _git_retry(workdir: Path | None, *args: str, attempts: int = 4,
@@ -265,12 +283,14 @@ class StepLog:
         self.idx = 0
 
     def start(self, name: str) -> float:
-        db.execute("INSERT INTO steps(run_id,idx,name,status,log) VALUES(?,?,?,'running','')",
-                   (self.run_id, self.idx, name))
-        self.step_id = db.query("SELECT last_insert_rowid() AS id")[0]["id"]
+        self.step_id = db.execute(
+            "INSERT INTO steps(run_id,idx,name,status,log) VALUES(?,?,?,'running','')",
+            (self.run_id, self.idx, name))
+        self.idx += 1
         return time.time()
 
-    def finish(self, t0: float, status: str, log: str = "", trace=None, prompt=None) -> None:
+    def finish(self, t0: float, status: str, log: str = "", trace=None, prompt=None,
+               step_id: int | None = None) -> None:
         stored_log = log if len(log) <= MAX_NODE_OUTPUT_CHARS else (
             log[:MAX_NODE_OUTPUT_CHARS] + "\n[报告展示日志超过 200000 字符，后续内容未保存；步骤状态基于完整执行结果]")
         db.execute(
@@ -278,8 +298,7 @@ class StepLog:
             (status, stored_log,
              json.dumps(trace, ensure_ascii=False) if trace else None,
              prompt if prompt else None,
-             int((time.time() - t0) * 1000), db.now(), self.step_id))
-        self.idx += 1
+             int((time.time() - t0) * 1000), db.now(), step_id or self.step_id))
 
 
 def _prepare(project: dict, run: dict, sl: StepLog) -> Path:

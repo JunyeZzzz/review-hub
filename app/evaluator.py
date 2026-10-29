@@ -11,6 +11,7 @@ import json
 import threading
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from . import config, db, worker
@@ -163,15 +164,41 @@ def _run_case(case: dict, progress=None) -> dict:
                 diff_text = built["diff_file"].read_text(encoding="utf-8")
                 continue
             if step.get("kind") == "review":
-                for member in step.get("reviewers", []):
-                    if not member.get("enabled", True):
-                        continue
-                    stage("独立评审 · " + (member.get("name") or member.get("id", "评审")))
-                    text, _, _ = worker._run_reviewer_step(member, project, workdir, built, diff_text, prior)
-                    name = member.get("name") or member.get("id", "评审")
-                    if verdict.extract_findings(text) is None:
-                        raise RuntimeError(f"{name} 未返回有效 findings JSON")
-                    outs.append((name, text))
+                members = [m for m in step.get("reviewers", []) if m.get("enabled", True)]
+                stage("并行交叉评审")
+                group_trace = trace[-1]
+                group_outputs = [None] * len(members)
+                errors = []
+                for offset in range(0, len(members), config.REVIEW_CONCURRENCY):
+                    batch = members[offset:offset + config.REVIEW_CONCURRENCY]
+                    entries = [{"name": "独立评审 · " + (m.get("name") or m.get("id", "评审")),
+                                "status": "running"} for m in batch]
+                    trace.extend(entries)
+                    if progress:
+                        progress("并行交叉评审", trace)
+                    with ThreadPoolExecutor(max_workers=len(batch), thread_name_prefix="hub-eval-review") as pool:
+                        futures = {pool.submit(worker._run_reviewer_step, member, project, workdir,
+                                               built, diff_text, [dict(item) for item in prior]): i
+                                   for i, member in enumerate(batch)}
+                        for future in as_completed(futures):
+                            i = futures[future]
+                            name = batch[i].get("name") or batch[i].get("id", "评审")
+                            try:
+                                text, _, _ = future.result()
+                                if verdict.extract_findings(text) is None:
+                                    raise RuntimeError("未返回有效 findings JSON")
+                            except Exception as exc:
+                                entries[i]["status"] = "fail"
+                                errors.append(f"{name}: {exc}")
+                            else:
+                                entries[i]["status"] = "ok"
+                                group_outputs[offset + i] = (name, text)
+                            if progress:
+                                progress("并行交叉评审", trace)
+                group_trace["status"] = "fail" if errors else "ok"
+                if errors:
+                    raise RuntimeError("交叉评审有成员失败；" + "；".join(errors))
+                outs.extend(group_outputs)
                 continue
             stage("上游上下文 · " + (step.get("name") or step.get("id", "分析")))
             text, _, _ = worker._run_reviewer_step(step, project, workdir, built, diff_text, prior)
@@ -183,8 +210,12 @@ def _run_case(case: dict, progress=None) -> dict:
         merged = verdict.merge_multi(outs)
         stage("与人工答案比对")
     except Exception as e:
-        if trace:
-            trace[-1]["status"] = "fail"
+        running = [entry for entry in trace if entry["status"] == "running"]
+        if running:
+            for entry in running:
+                entry["status"] = "fail"
+        elif not any(entry["status"] == "fail" for entry in trace):
+            trace.append({"name": "评测失败", "status": "fail"})
         return {**base, "result": "error", "detail": str(e)[-300:], "steps": trace}
     finally:
         if "parent" in locals():
