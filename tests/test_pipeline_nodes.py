@@ -148,6 +148,11 @@ class PipelineNodesTest(unittest.TestCase):
         self.assertIn("findings", text)
         self.assertEqual(observed["auth"], "Bearer secret-123")
         self.assertEqual(observed["body"]["messages"][0]["content"], "full context")
+        self.assertNotIn("max_tokens", observed["body"])
+        with patch.object(api_nodes.httpx, "Client", side_effect=lambda **kw: client_class(
+                transport=httpx.MockTransport(handler), **kw)):
+            api_nodes.run({"credential_id": cid, "model": "test-model"}, "short check", max_tokens=32)
+        self.assertEqual(observed["body"]["max_tokens"], 32)
 
     def test_anthropic_api_node_uses_messages_protocol(self):
         cid = api_nodes.create("team-claude", "anthropic", "anthropic-secret")

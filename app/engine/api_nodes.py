@@ -107,6 +107,8 @@ def run(step: dict, prompt: str, *, timeout: int = 180, max_tokens: int = 4096) 
         url = base + "/chat/completions"
         headers = {"api-key": key} if credential["provider"] == "azure" else {"Authorization": "Bearer " + key}
         payload = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+        if max_tokens != 4096:  # 手动检测显式限制输出；普通评审保持现有兼容请求
+            payload["max_tokens"] = max_tokens
         if credential["provider"] == "gemini":
             headers["x-goog-api-client"] = "review-hub/1.0"
     try:
