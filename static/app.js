@@ -1145,6 +1145,7 @@ const jsCommitCache = {};   // pid -> {commits, error}：记上次结果，回�
 let detailSig = "";   // 上次渲染的数据签名：没变化就一根手指都不动
 
 async function renderProjectDetail(pid, silent) {
+  if (location.hash !== `#/projects/${pid}`) return;
   if (!silent) { setTitle("项目"); showSkeleton(); }
   const savedY = window.scrollY;
   const hadCache = !!jsCommitCache[pid];
@@ -1163,7 +1164,11 @@ async function renderProjectDetail(pid, silent) {
       api("/api/projects").then((l) => l.find((x) => x.id === pid)),
       api(`/api/runs?project_id=${pid}`),
     ]);
-  } catch (e) { errorPanel(e.message); return; }
+  } catch (e) {
+    if (location.hash === `#/projects/${pid}`) errorPanel(e.message);
+    return;
+  }
+  if (location.hash !== `#/projects/${pid}`) return;
   if (!p) { location.hash = "#/projects"; return; }
   const cached = jsCommitCache[pid];
 
@@ -2456,18 +2461,22 @@ async function mountConfigHistory(containerId, key, onRestored) {
 /* ---------------- 项目级流水线编排（覆盖全局默认） ---------------- */
 
 async function renderProjectPipeline(pid) {
+  if (location.hash !== `#/projects/${pid}/pipeline`) return;
   setTitle("流水线编排");
   showSkeleton();
   let p, pp;
   try {
-    [p, pp] = await Promise.all([
+    [p, pp, nodeCredentials] = await Promise.all([
       api("/api/projects").then((l) => l.find((x) => x.id === pid)),
       api(`/api/projects/${pid}/pipeline`),
+      api("/api/model-credentials"),
     ]);
-  } catch (e) { errorPanel(e.message); return; }
+  } catch (e) {
+    if (location.hash === `#/projects/${pid}/pipeline`) errorPanel(e.message);
+    return;
+  }
+  if (location.hash !== `#/projects/${pid}/pipeline`) return;
   if (!p) { location.hash = "#/projects"; return; }
-  nodeCredentials = await api("/api/model-credentials");
-
   const draft = JSON.parse(JSON.stringify(pp.steps));
   $app.innerHTML = `
     ${pageHead({

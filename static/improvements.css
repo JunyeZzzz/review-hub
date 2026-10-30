@@ -812,3 +812,17 @@
 .im-remaining-row button {
   flex: none;
 }
+
+
+.im-review-note summary,
+.im-history-note summary {
+  cursor: pointer;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+.im-history-note summary {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.im-use-list .im-use-audit { grid-column: 1 / -1; color: var(--ok); }

@@ -39,6 +39,35 @@ class DefaultBranchWorkflowTest(unittest.TestCase):
         config.DB_PATH, config.DATA_DIR, connections.SECRET_DIR = self.old_db, self.old_data, self.old_secrets
         self.tmp.cleanup()
 
+    def test_profile_initialization_uses_managed_kimi_runner(self):
+        db.set_setting('kimi_api_key', 'managed-test-key')
+        profile='面向小团队的代码审查服务，使用 Python 与浏览器界面。'
+        def run(workdir, prompt_file, **kwargs):
+            self.assertTrue(prompt_file.is_file())
+            self.assertIn('owner/repo', prompt_file.read_text())
+            self.assertEqual(kwargs, {'timeout':300,'skip_git_check':True})
+            return profile, []
+        with patch.object(config,'KIMI_API_KEY',''), \
+             patch.object(connections,'token_for_project',return_value='test-token'), \
+             patch.object(github,'repo_info',return_value={'default_branch':'main'}), \
+             patch.object(github,'readme_text',return_value='Hub'), \
+             patch.object(worker.reviewers,'run_codex',side_effect=run) as call:
+            worker.process_init(self.pid)
+        row=db.get('SELECT profile,init_status FROM projects WHERE id=?',(self.pid,))
+        self.assertEqual(row['init_status'],'done')
+        self.assertEqual(row['profile'],profile)
+        call.assert_called_once()
+
+    def test_profile_initialization_rejects_overlong_output_without_silent_cut(self):
+        with patch.object(connections,'token_for_project',return_value='test-token'), \
+             patch.object(github,'repo_info',return_value={'default_branch':'main'}), \
+             patch.object(github,'readme_text',return_value='Hub'), \
+             patch.object(worker.reviewers,'run_codex',return_value=('中'*601, [])):
+            worker.process_init(self.pid)
+        row=db.get('SELECT profile,init_status FROM projects WHERE id=?',(self.pid,))
+        self.assertEqual(row['init_status'],'failed')
+        self.assertIn('超过600字符',row['profile'])
+
     def test_webhook_ignores_pr_and_other_branches_then_queues_main_range(self):
         with patch.object(github, "verify_signature", return_value=True):
             def send(event, payload):

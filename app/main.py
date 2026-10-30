@@ -56,15 +56,17 @@ def startup() -> None:
 
 @app.get("/")
 def index():
-    return FileResponse(Path(__file__).parent.parent / "static" / "index.html")
+    return FileResponse(Path(__file__).parent.parent / "static" / "index.html",
+                        headers={"Cache-Control":"no-cache, max-age=0, must-revalidate"})
 
 
 @app.get("/static/{name}")
 def static_file(name: str):
-    p = Path(__file__).parent.parent / "static" / name
-    if not p.exists():
+    root = (Path(__file__).parent.parent / "static").resolve()
+    p = (root / name).resolve()
+    if p.parent != root or not p.is_file():
         raise HTTPException(404)
-    return FileResponse(p)
+    return FileResponse(p, headers={"Cache-Control":"no-cache, max-age=0, must-revalidate"})
 
 
 # ---------------- 设置 / 状态 ----------------

@@ -18,6 +18,39 @@ function load(name, globals) {
 }
 
 const cases = {
+  async project_completion_after_navigation_does_not_replace_the_page() {
+    for (const fail of [false, true]) {
+      let finish, reject, mutations = 0;
+      const pending = new Promise((resolve, rejecter) => {finish=resolve;reject=rejecter;});
+      const location = {hash: '#/projects/11'};
+      const render = load('renderProjectDetail', {
+        location, window: {scrollY:0}, jsCommitCache:{}, detailSig:'',
+        setTitle() {}, showSkeleton() {},
+        api: path => path === '/api/projects' ? pending : path.includes('/commits') ? new Promise(() => {}) : Promise.resolve([]),
+        errorPanel: () => {mutations++;}, paintProjectDetail: () => {mutations++;},
+        document:{body:{classList:{add(){mutations++;}}},querySelector:()=>null},
+        requestAnimationFrame(){}, autoRefresh(){mutations++;},
+      });
+      const done = render(11, false);
+      location.hash = '#/workbench';
+      if (fail) reject(new Error('network unavailable')); else finish([{id:11}]);
+      await done;
+      assert.equal(mutations,0,`late ${fail ? 'error' : 'success'} must not replace the new page`);
+    }
+  },
+  async project_credentials_failure_is_visible() {
+    const errors = [];
+    const render = load('renderProjectPipeline', {
+      setTitle() {}, showSkeleton() {}, errorPanel: message => errors.push(message),
+      api: async path => {
+        if (path === '/api/projects') return [{id: 11, name: 'hub'}];
+        if (path === '/api/projects/11/pipeline') return {steps: []};
+        throw new Error('凭证服务暂不可用');
+      }, location: {hash: '#/projects/11/pipeline'},
+    });
+    await render(11);
+    assert.deepEqual(errors, ['凭证服务暂不可用']);
+  },
   async legacy_validation_policy_is_visible() {
     const render = load('imValidationHtml', {esc: String});
     const validation = {id: 1, status: 'done', results: [], snapshot: {cases: []}};

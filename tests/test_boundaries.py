@@ -33,6 +33,22 @@ class BoundariesTest(unittest.TestCase):
         connections.SECRET_DIR = self.original_secrets
         self.tmp.cleanup()
 
+    def test_static_endpoint_serves_only_files_inside_its_root(self):
+        web=self.root/'web';(web/'app').mkdir(parents=True);assets=web/'static';assets.mkdir()
+        (assets/'app.js').write_text('public asset')
+        (web/'secret.txt').write_text('private fixture')
+        (assets/'outside.js').symlink_to(web/'secret.txt')
+        with patch.object(main,'__file__',str(web/'app/main.py')):
+            client=TestClient(main.app,raise_server_exceptions=False)
+            response=client.get('/static/app.js')
+            self.assertEqual(response.status_code,200)
+            self.assertEqual(response.text,'public asset')
+            self.assertIn('no-cache',response.headers['cache-control'])
+            for path in ['/static/%2e%2e','/static/outside.js','/static/%2e%2e%2fsecret.txt']:
+                response=client.get(path)
+                self.assertEqual(response.status_code,404,path)
+                self.assertNotIn('private fixture',response.text)
+
     def test_credentials_are_explicit_and_never_listed(self):
         a = connections.create("team-a", "secret-a")
         b = connections.create("team-b", "secret-b")

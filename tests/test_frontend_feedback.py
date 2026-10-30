@@ -24,6 +24,12 @@ class FrontendFeedbackTest(unittest.TestCase):
     def test_legacy_validation_without_policy_is_explained(self):
         self.check_scenario('legacy_validation_policy_is_visible', 'improvements.js')
 
+    def test_project_completion_after_navigation_does_not_replace_the_page(self):
+        self.check_scenario('project_completion_after_navigation_does_not_replace_the_page')
+
+    def test_project_credentials_failure_renders_an_error(self):
+        self.check_scenario('project_credentials_failure_is_visible')
+
     def test_empty_api_credential_cannot_be_saved_as_zero(self):
         self.check_scenario('empty_api_credential_is_rejected')
 

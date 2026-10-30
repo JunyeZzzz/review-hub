@@ -949,22 +949,20 @@ def process_init(project_id: int) -> None:
             language=info.get("language") or "（未知）",
             readme=readme.strip() or "（没有 README）",
         )
-        if not config.KIMI_API_KEY or not config.CODEX_BIN:
-            raise RuntimeError("Kimi/codex 不可用，无法自动生成画像；可在项目卡片手动填写")
-        env = os.environ.copy()
-        env["CODEX_HOME"] = str(config.CODEX_HOME)
-        env["KIMI_API_KEY"] = config.KIMI_API_KEY
-        env["PATH"] = config.SUBPROCESS_PATH
-        r = subprocess.run(
-            [config.CODEX_BIN, "exec", "--sandbox", "read-only", "--skip-git-repo-check", prompt],
-            cwd="/tmp", capture_output=True, text=True, timeout=300, env=env)
-        if r.returncode != 0:
-            raise RuntimeError(f"codex 退出码 {r.returncode}：{(r.stderr or r.stdout)[-300:]}")
-        text = r.stdout.split("tokens used")[0].strip()
+        # Same managed key/model/endpoint and JSONL parser as real review calls.
+        with tempfile.TemporaryDirectory(prefix="hub-profile-") as td:
+            workdir = Path(td)
+            prompt_file = workdir / "profile.txt"
+            prompt_file.write_text(prompt, encoding="utf-8")
+            with _CLI_SLOTS['codex'], _MODEL_SLOTS:
+                text, _trace = reviewers.run_codex(workdir, prompt_file, timeout=300, skip_git_check=True)
+        text = text.strip()
         if not text:
             raise RuntimeError("模型返回为空")
+        if len(text) > 600:
+            raise RuntimeError(f"项目画像超过600字符（实际{len(text)}），未保存截断内容；请重试或手动填写")
         db.execute("UPDATE projects SET profile=?, init_status='done' WHERE id=?",
-                   (text[-600:], project_id))
+                   (text, project_id))
         print(f"[hub] 项目画像完成：{p['full_name']} -> {text[:60]}…")
     except Exception as e:
         traceback.print_exc()
