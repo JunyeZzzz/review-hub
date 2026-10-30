@@ -206,6 +206,7 @@ function imEventHtml(e) {
     adoption_policy_reassessed: "复核采用规则",
     baseline_checkpoint_recovered: "恢复完整基线检查点",
     parser_reprocessed: "重新解析真实模型回复",
+    // 也展示有审计记录的一次性数据恢复事件；系统不自动猜测或修补模型回复。
     output_encoding_recovered: "恢复模型回复的 JSON 转义",
     code_regressions_added: "历史反馈已加入代码回归",
     interrupted: "任务中断",

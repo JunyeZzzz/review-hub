@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from app import github
+from app import github, worker
 
 
 class RevertCommitTest(unittest.TestCase):
@@ -44,6 +44,24 @@ class RevertCommitTest(unittest.TestCase):
                                      'https://github.com/owner/repo/pull/1')
                 revert=next(c for c in calls if c[:3]==['git','revert','--no-edit'])
                 self.assertEqual('-m' in revert,expected_merge)
+            with patch.object(github,'repo_info',return_value={'default_branch':'main'}), \
+                 patch('app.git_auth.auth_env',return_value=env), \
+                 patch.object(github.subprocess,'run',side_effect=execute), patch.object(github,'gh') as gh:
+                with self.assertRaisesRegex(RuntimeError,'无法读取回滚目标提交'):
+                    github.create_revert_pr('owner/repo','f'*40,'test',token='test-token')
+                gh.assert_not_called()
+
+    def test_legacy_merged_followup_uses_current_signature(self):
+        project={'full_name':'owner/repo','auto_revert':True}
+        run={'id':1,'pr_number':None,'trigger':'merged','head_sha':'a'*40}
+        with patch.object(github,'create_revert_pr',autospec=True,return_value='https://example.com/pr') as create, \
+             patch('app.connections.token_for_project',return_value='test-token'), \
+             patch('app.db.execute') as save:
+            worker._github_followup(project,run,{'important_count':1},'blocked')
+        create.assert_called_once_with('owner/repo','a'*40,
+            '合并后评审发现 1 个 Important（run #1）',token='test-token')
+        save.assert_called_once()
+
 
 
 if __name__=='__main__':

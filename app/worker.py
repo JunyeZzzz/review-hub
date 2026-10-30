@@ -756,7 +756,7 @@ def _github_followup(project: dict, run: dict, merged: dict, status: str) -> Non
             and project["auto_revert"] and run["head_sha"]):
         try:
             url = github.create_revert_pr(
-                project["full_name"], run["head_sha"], True,
+                project["full_name"], run["head_sha"],
                 f"合并后评审发现 {merged['important_count']} 个 Important（run #{run['id']}）",
                 token=connections.token_for_project(project))
             db.execute("UPDATE runs SET revert_pr_url=? WHERE id=?", (url, run["id"]))

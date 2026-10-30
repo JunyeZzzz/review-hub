@@ -162,8 +162,11 @@ def create_revert_pr(full_name: str, sha: str, reason: str, *, token: str | None
         url = f"https://github.com/{full_name}.git"
         subprocess.run(["git", "clone", "--depth", "50", url, str(repo_dir)],
                        check=True, capture_output=True, env=env)
-        commit = subprocess.run(["git", "cat-file", "-p", f"{sha}^{{commit}}"],
-                                cwd=repo_dir, check=True, capture_output=True, text=True).stdout
+        probe = subprocess.run(["git", "cat-file", "-p", f"{sha}^{{commit}}"],
+                               cwd=repo_dir, capture_output=True, text=True)
+        if probe.returncode:
+            raise RuntimeError(f"无法读取回滚目标提交 {sha}（可能超出浅克隆范围）：{(probe.stderr or '')[-200:]}")
+        commit = probe.stdout
         # Read actual commit headers, including shallow-boundary parents; a push
         # event does not tell us whether its head is a merge commit.
         parents = [line for line in commit.split("\n\n", 1)[0].splitlines() if line.startswith("parent ")]
