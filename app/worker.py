@@ -464,8 +464,20 @@ def _intent_for_range(workdir: Path, run: dict, diff_spec: str, fallback: str) -
     history = _git(workdir, "log", "--reverse", "--format=%h %s%n%b%x00", diff_spec).stdout
     messages = [item.strip() for item in history.split("\x00") if item.strip()]
     if not messages:
-        raise RuntimeError(f"审查区间 {diff_spec} 没有可读取的提交说明，无法确认变更意图")
-    intent = f"本次审查覆盖 {len(messages)} 个提交（按时间顺序）：\n" + "\n\n".join(messages)
+        # Force-reset has no newly reachable commits, but may remove real code.
+        ends = diff_spec.split("..")
+        if (len(ends) != 2 or not all(ends)
+                or _git(workdir, "merge-base", "--is-ancestor", ends[1], ends[0], check=False).returncode != 0
+                or _git(workdir, "diff", "--quiet", diff_spec, check=False).returncode != 1):
+            raise RuntimeError(f"审查区间 {diff_spec} 没有可读取的提交说明，无法确认变更意图")
+        removed = _git(workdir, "log", "--reverse", "--format=%h %s%n%b%x00", f"{ends[1]}..{ends[0]}").stdout
+        messages = [item.strip() for item in removed.split("\x00") if item.strip()]
+        if not messages:
+            raise RuntimeError("回退区间无法读取被移除的提交说明")
+        intent = (f"分支回退到历史祖先提交 {ends[1]}；本次应审查完整反向代码差异。"
+                  f"以下 {len(messages)} 个提交被移除，不是新引入的功能（按原时间顺序）：\n" + "\n\n".join(messages))
+    else:
+        intent = f"本次审查覆盖 {len(messages)} 个提交（按时间顺序）：\n" + "\n\n".join(messages)
     if len(intent) > MAX_INTENT_CHARS:
         raise RuntimeError(f"提交说明共 {len(intent)} 字符，超过 {MAX_INTENT_CHARS} 上限；请拆分审查，不能只保留最后一个提交说明")
     return intent

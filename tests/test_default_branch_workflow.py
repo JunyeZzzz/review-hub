@@ -180,6 +180,18 @@ class DefaultBranchWorkflowTest(unittest.TestCase):
             f"{root_base}..{after}", "third")
         self.assertIn("完整代码差异", tree_intent)
         self.assertNotIn("third", tree_intent)
+        # A force-reset removes commits yet still changes the reviewed tree.
+        rollback_intent = worker._intent_for_range(
+            repo, {"trigger": "push", "base_ref": after}, f"{after}..{before}", "first")
+        self.assertIn("回退", rollback_intent)
+        self.assertIn("移除", rollback_intent)
+        self.assertIn("second", rollback_intent)
+        self.assertIn("third", rollback_intent)
+        rollback_diff = prompts.build(repo, diff_spec=f"{after}..{before}")["diff_file"].read_text()
+        self.assertIn("deleted file", rollback_diff)
+        with self.assertRaises(RuntimeError):
+            worker._intent_for_range(repo, {"trigger": "push", "base_ref": before},
+                                     f"{before}..{before}", "first")
 
     def test_large_git_diff_keeps_last_line_and_creates_review_parts(self):
         repo = self.root / "large-repo"

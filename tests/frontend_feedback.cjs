@@ -18,6 +18,13 @@ function load(name, globals) {
 }
 
 const cases = {
+  async legacy_validation_policy_is_visible() {
+    const render = load('imValidationHtml', {esc: String});
+    const validation = {id: 1, status: 'done', results: [], snapshot: {cases: []}};
+    assert.match(render(validation), /本轮最初使用旧规则 all-hit-v1/);
+    validation.snapshot.adoption_policy = 'incremental-v2';
+    assert.doesNotMatch(render(validation), /本轮最初使用旧规则 all-hit-v1/);
+  },
   async leave_during_evaluation() {
     let tick, finish, changed = 0;
     const location = {hash: '#/workbench'};

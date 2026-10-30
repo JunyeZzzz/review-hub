@@ -310,7 +310,7 @@ class PipelineNodesTest(unittest.TestCase):
             def finish(self, *args, **kwargs): pass
         def execute(step, project, workdir, built, diff_text, received):
             seen.append((step["name"], list(received)))
-            return f'```json\n{{"findings": []}}\n```\n{step["name"]}', None, "prompt"
+            return f'{step["name"]}\n```json\n{{"findings": []}}\n```', None, "prompt"
         with patch.object(worker, "_run_reviewer_step", side_effect=execute):
             outs = worker._run_review_group(group, {}, self.root, {}, "", prior, FakeLog())
         self.assertEqual([name for name, _ in outs], ["A", "B"])
@@ -329,7 +329,7 @@ class PipelineNodesTest(unittest.TestCase):
                 self.assertTrue(b_done.wait(3))
             else:
                 b_done.set()
-            return f'```json\n{{"findings": []}}\n```\n{step["name"]}', None, "prompt"
+            return f'{step["name"]}\n```json\n{{"findings": []}}\n```', None, "prompt"
         with patch.object(worker, "_run_reviewer_step", side_effect=execute):
             outputs = worker._run_review_group(group, {}, self.root, {}, "", [], worker.StepLog(77))
         self.assertEqual([name for name, _ in outputs], ["A", "B"])

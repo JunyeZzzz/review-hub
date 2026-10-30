@@ -149,7 +149,7 @@ def upsert_pr_comment(full_name: str, number: int, body: str, *, token: str | No
 
 # ---------- 回滚（revert PR） ----------
 
-def create_revert_pr(full_name: str, sha: str, is_merge: bool, reason: str, *, token: str | None = None) -> str:
+def create_revert_pr(full_name: str, sha: str, reason: str, *, token: str | None = None) -> str:
     """克隆仓库 -> revert -> 推分支 -> 开 PR。返回 PR URL。"""
     if not token:
         raise NeedToken("该仓库未绑定可用的 GitHub 连接")
@@ -162,7 +162,12 @@ def create_revert_pr(full_name: str, sha: str, is_merge: bool, reason: str, *, t
         url = f"https://github.com/{full_name}.git"
         subprocess.run(["git", "clone", "--depth", "50", url, str(repo_dir)],
                        check=True, capture_output=True, env=env)
-        cmd = ["git", "revert", "--no-edit", "-m", "1", sha] if is_merge else ["git", "revert", "--no-edit", sha]
+        commit = subprocess.run(["git", "cat-file", "-p", f"{sha}^{{commit}}"],
+                                cwd=repo_dir, check=True, capture_output=True, text=True).stdout
+        # Read actual commit headers, including shallow-boundary parents; a push
+        # event does not tell us whether its head is a merge commit.
+        parents = [line for line in commit.split("\n\n", 1)[0].splitlines() if line.startswith("parent ")]
+        cmd = ["git", "revert", "--no-edit", "-m", "1", sha] if len(parents) > 1 else ["git", "revert", "--no-edit", sha]
         r = subprocess.run(cmd, cwd=repo_dir, capture_output=True, text=True)
         if r.returncode != 0:
             subprocess.run(["git", "revert", "--abort"], cwd=repo_dir, capture_output=True)

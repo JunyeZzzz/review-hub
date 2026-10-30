@@ -14,8 +14,8 @@ def extract_findings(text: str):
             data, end = json.JSONDecoder().raw_decode(raw)
         except json.JSONDecodeError:
             continue
-        if not raw[end:].lstrip().startswith('```'):
-            continue  # 缺少外层结束标记仍是不完整输出，不能判为通过。
+        if raw[end:].strip() != '```':
+            continue  # 只接收最终完整块，不能退回前面的示例把坏掉的最终结果判为通过。
         if isinstance(data, dict) and isinstance(data.get("findings"), list):
             findings = data["findings"]
             if all(isinstance(f, dict) and isinstance(f.get("title"), str) and f["title"].strip()

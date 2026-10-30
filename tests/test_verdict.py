@@ -18,6 +18,12 @@ class FindingsParserTest(unittest.TestCase):
                      '```json\n{"findings":[{"title":"x","fix":"unterminated}]}\n```']:
             self.assertIsNone(verdict.extract_findings(text))
 
+    def test_valid_example_cannot_hide_malformed_final_result(self):
+        prefix='```json\n{"findings":[]}\n```\n'
+        for tail in ['```json\n{"findings":',
+                     '```json\n{"findings":[{"title":"bad","fix":"unescaped "quote""}]}\n```']:
+            self.assertIsNone(verdict.extract_findings(prefix+tail))
+
     def test_last_valid_complete_block_wins(self):
         text='```json\n{"findings":[{"title":"earlier"}]}\n```\n```json\n{"findings":[]}\n```'
         self.assertEqual(verdict.extract_findings(text),[])

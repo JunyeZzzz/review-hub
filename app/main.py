@@ -1272,7 +1272,7 @@ def revert_run(run_id: int):
         raise HTTPException(400, "本地项目回滚请直接在仓库执行 git revert")
     try:
         url = github.create_revert_pr(
-            run["repo"], run["head_sha"], run["trigger"] == "merged",
+            run["repo"], run["head_sha"],
             f"run #{run_id} 评审发现 {run['important_count']} 个 Important",
             token=connections.token_for_project(db.get("SELECT * FROM projects WHERE id=?", (run["project_id"],))))
     except ValueError as e:
