@@ -5,12 +5,17 @@ from difflib import SequenceMatcher
 
 
 def extract_findings(text: str):
-    blocks = re.findall(r"```json\s*(.*?)```", text or "", flags=re.S)
-    for raw in reversed(blocks):
+    # JSON 字符串内可合法包含 Markdown 代码块，不能用非贪婪正则裁掉它。
+    source = text or ''
+    starts = list(re.finditer(r"```json\b\s*", source))
+    for start in reversed(starts):
+        raw = source[start.end():]
         try:
-            data = json.loads(raw.strip())
+            data, end = json.JSONDecoder().raw_decode(raw)
         except json.JSONDecodeError:
             continue
+        if not raw[end:].lstrip().startswith('```'):
+            continue  # 缺少外层结束标记仍是不完整输出，不能判为通过。
         if isinstance(data, dict) and isinstance(data.get("findings"), list):
             findings = data["findings"]
             if all(isinstance(f, dict) and isinstance(f.get("title"), str) and f["title"].strip()

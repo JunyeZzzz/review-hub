@@ -11,6 +11,7 @@ import json
 import threading
 import shutil
 import tempfile
+from . import improvements
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -50,6 +51,7 @@ def _config_snapshot() -> str:
         "active_improvements": [dict(r) for r in db.query("SELECT * FROM review_improvements WHERE status='active' ORDER BY id")],
         "profiles": {str(r['id']): r['profile'] for r in db.query('SELECT id,profile FROM projects ORDER BY id')},
         "cli_models": [config.get_kimi_model(), config.get_claude_model(), config.get_kimi_base_url()],
+        "cli_binaries":config.cli_identity(),
     }, ensure_ascii=False)
 
 
@@ -119,6 +121,7 @@ def _run_case(case: dict, progress=None, improvement_items=None) -> dict:
         return {**base, "result": "error", "detail": "用例所属项目不是 GitHub 项目（MVP 只支持 GitHub）",
                 "steps": [{"name": "验证项目", "status": "fail"}]}
     base["repo"] = project["full_name"]
+    project={**dict(project),'_cli_identity':config.cli_identity()}
     try:
         source = db.get("SELECT trigger,base_ref,head_sha FROM runs WHERE id=? AND project_id=?",
                         (case.get("run_id"), case["project_id"]))
@@ -141,6 +144,7 @@ def _run_case(case: dict, progress=None, improvement_items=None) -> dict:
                               profile=project["profile"] or "", diff_spec=diff_spec)
         diff_text = built["diff_file"].read_text(encoding="utf-8")
         outs = []
+        review_details = []
         prior = []
         diff_files = built.get('changed_files', [line[6:] for line in diff_text.splitlines()
                                                if line.startswith(('+++ b/', '--- a/'))])
@@ -166,6 +170,8 @@ def _run_case(case: dict, progress=None, improvement_items=None) -> dict:
                 if gate_result.get("status") not in ("ok", "skip"):
                     raise RuntimeError(f"评测门禁未通过：{step.get('name') or gtype}"
                                        f"（状态 {gate_result.get('status')!r}）")
+                trace[-1].update(status=gate_result['status'], detail=gate_result.get('log', ''),
+                                 command=gate_result.get('cmd', ''))
                 worker._git_retry(workdir, "checkout", "--detach", "-f", case["head_sha"])
                 worker._git_retry(workdir, "clean", "-fdx")
                 built = prompts.build(workdir, intent=case["intent"] or "",
@@ -178,6 +184,7 @@ def _run_case(case: dict, progress=None, improvement_items=None) -> dict:
                 stage("并行交叉评审")
                 group_trace = trace[-1]
                 group_outputs = [None] * len(members)
+                group_details = [None] * len(members)
                 errors = []
                 for offset in range(0, len(members), config.REVIEW_CONCURRENCY):
                     batch = members[offset:offset + config.REVIEW_CONCURRENCY]
@@ -187,28 +194,54 @@ def _run_case(case: dict, progress=None, improvement_items=None) -> dict:
                     if progress:
                         progress("并行交叉评审", trace)
                     with ThreadPoolExecutor(max_workers=len(batch), thread_name_prefix="hub-eval-review") as pool:
-                        futures = {pool.submit(worker._run_reviewer_step, member, project, workdir,
-                                               built, diff_text, [dict(item) for item in prior]): i
-                                   for i, member in enumerate(batch)}
+                        futures = {}
+                        part_lock = threading.Lock()
+                        for i, member in enumerate(batch):
+                            states = {}
+                            def part_progress(index, total, status, entry=entries[i], states=states):
+                                with part_lock:
+                                    states[index] = status
+                                    entry['part'] = {'index':index,'total':total,'status':status,
+                                                     'done':sum(s=='ok' for s in states.values()),
+                                                     'running':[i for i,s in states.items() if s=='running'],
+                                                     'failed':[i for i,s in states.items() if s=='fail'],
+                                                     'queued':sum(s=='queued' for s in states.values())}
+                                    if progress:
+                                        progress(f"{entry['name']} · 分片完成 {entry['part']['done']}/{total}", trace)
+                            futures[pool.submit(worker._run_reviewer_step, member, project, workdir,
+                                                {**built, 'part_progress':part_progress}, diff_text,
+                                                [dict(item) for item in prior])] = i
                         for future in as_completed(futures):
                             i = futures[future]
                             name = batch[i].get("name") or batch[i].get("id", "评审")
                             try:
-                                text, _, _ = future.result()
+                                text, model_trace, actual_input = future.result()
                                 if verdict.extract_findings(text) is None:
-                                    raise RuntimeError("未返回有效 findings JSON")
+                                    raise worker._unparsed_review_error(text,model_trace,actual_input)
                             except Exception as exc:
                                 entries[i]["status"] = "fail"
+                                entries[i]['trace'] = getattr(exc, 'trace', None)
+                                if getattr(exc,'output',None) is not None:
+                                    group_details[offset+i]={'name':name+' · 未解析的原始片段','output':exc.output,
+                                        'incomplete':True,'evidence_id':improvements.save_review_evidence(
+                                            exc.output,getattr(exc,'trace',[]),getattr(exc,'input_evidence',''))}
                                 errors.append(f"{name}: {exc}")
                             else:
                                 entries[i]["status"] = "ok"
                                 group_outputs[offset + i] = (name, text)
+                                group_details[offset + i] = {'name':name,'output':text,
+                                    'evidence_id':improvements.save_review_evidence(text,model_trace,actual_input)}
                             if progress:
                                 progress("并行交叉评审", trace)
                 group_trace["status"] = "fail" if errors else "ok"
+                base['reviews'] = review_details + [d for d in group_details if d is not None]
                 if errors:
+                    partial = [out for out in group_outputs if out is not None]
+                    if partial:
+                        base['actual'] = verdict.merge_multi(outs + partial)['findings']
                     raise RuntimeError("交叉评审有成员失败；" + "；".join(errors))
                 outs.extend(group_outputs)
+                review_details.extend(group_details)
                 continue
             stage("上游上下文 · " + (step.get("name") or step.get("id", "分析")))
             text, _, _ = worker._run_reviewer_step(step, project, workdir, built, diff_text, prior)
@@ -218,7 +251,7 @@ def _run_case(case: dict, progress=None, improvement_items=None) -> dict:
         if not outs:
             raise RuntimeError("评测没有有效的评审器输出，不能判定通过")
         merged = verdict.merge_multi(outs)
-        base['reviews'] = [{'name': name, 'output': output} for name, output in outs]
+        base['reviews'] = review_details
         stage("与人工答案比对")
     except Exception as e:
         running = [entry for entry in trace if entry["status"] == "running"]

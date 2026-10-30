@@ -60,7 +60,11 @@ def run_grouped(cmd: list[str], *, cwd: str | Path, env: dict,
             if remaining <= 0:
                 _stop_group(proc)
                 # Agent 的命令参数可能含完整源码提示词，异常不可回显它们。
-                raise subprocess.TimeoutExpired(cmd[:1], timeout)
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                raise subprocess.TimeoutExpired(cmd[:1], timeout,
+                    output=stdout_file.read().decode('utf-8', errors='replace'),
+                    stderr=stderr_file.read().decode('utf-8', errors='replace'))
             time.sleep(min(0.05, remaining))
         try:
             os.killpg(proc.pid, 0)

@@ -203,6 +203,32 @@ class DefaultBranchWorkflowTest(unittest.TestCase):
         self.assertIn("changed_line_9000 = 9000", built["diff_file"].read_text())
         self.assertGreater(len(built["review_parts"]), 1)
         self.assertIn("changed_line_9000 = 9000", built["review_parts"][-1].read_text())
+        self.assertEqual(built['review_part_paths'], [['code.py']] * len(built['review_parts']))
+
+    def test_part_scope_preserves_git_paths_for_rename_unicode_and_deleted_files(self):
+        repo = self.root / 'path-repo'
+        repo.mkdir()
+        def git(*args):
+            return subprocess.run(['git', *args], cwd=repo, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git('init', '-b', 'main')
+        (repo / 'old.txt').write_text('rename this\n')
+        (repo / 'deleted.txt').write_text('removed\n')
+        git('add', '.')
+        git('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'base')
+        before = git('rev-parse', 'HEAD')
+        (repo / 'old.txt').rename(repo / '新 名称.txt')
+        (repo / 'deleted.txt').unlink()
+        (repo / 'space name.py').write_text(''.join(f'line{i}\n' for i in range(25)))
+        git('add', '.')
+        git('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'change')
+        with patch.object(prompts, 'MAX_REVIEW_PART_LINES', 10):
+            built = prompts.build(repo, diff_spec=f'{before}..HEAD')
+        self.assertEqual(built['changed_files'], ['deleted.txt', 'space name.py', '新 名称.txt'])
+        self.assertEqual({p for paths in built['review_part_paths'] for p in paths},
+                         set(built['changed_files']))
+        self.assertEqual(built['review_part_paths'][0], ['deleted.txt', 'space name.py'])
+        self.assertEqual(built['review_part_paths'][-1][-1], '新 名称.txt')
 
     def test_binary_change_cannot_receive_text_only_pass(self):
         repo = self.root / "binary-repo"

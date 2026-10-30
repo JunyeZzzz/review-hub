@@ -921,7 +921,7 @@ def mark_finding(run_id: int, idx: int, body: MarkIn):
     if run['status'] not in ('passed', 'blocked', 'failed'):
         raise HTTPException(409, '请等待审查结束后再判定')
     finding = json.loads(run['findings_json'] or '[]')[idx]
-    if any(str(s).startswith('gate:') or str(s) == 'gitleaks-like' for s in finding.get('sources', [])):
+    if body.disposition and any(str(s).startswith('gate:') or str(s) == 'gitleaks-like' for s in finding.get('sources', [])):
         raise HTTPException(400, '机械门禁结果不能作为模型反馈')
     note = _bounded_text(body.note.strip(), 3000, "判定原因")
     evidence = _bounded_text(body.evidence.strip(), 3000, "判定证据")
@@ -1030,6 +1030,21 @@ def improvement_revoke(iid: int):
 @app.post('/api/improvement-validations/{vid}/review')
 def improvement_review_validation(vid: int, body: dict):
     return improvements.review_validation(vid, body)
+
+
+@app.post('/api/improvement-validations/{vid}/reassess')
+def improvement_reassess_validation(vid: int, body: dict):
+    return improvements.reassess_validation(vid,body.get('note'))
+
+
+@app.post('/api/improvement-validations/{vid}/resume')
+def improvement_resume_validation(vid: int):
+    return improvements.resume_validation(vid)
+
+
+@app.get('/api/review-evidence/{digest}')
+def review_evidence(digest: str):
+    return improvements.read_review_evidence(digest)
 
 
 # ---------------- 评测集：改提示词/换模型前先过回归 ----------------

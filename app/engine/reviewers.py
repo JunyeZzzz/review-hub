@@ -18,6 +18,13 @@ class ReviewerError(RuntimeError):
     pass
 
 
+def _timeout_error(exc, parser, label):
+    _, trace = parser(exc.output or '', allow_partial=True)
+    error = ReviewerError(f'{label} 调用超时（{exc.timeout} 秒），未得出完整结论；已保留超时前的工具轨迹')
+    error.trace = trace or []
+    return error
+
+
 def _subprocess_env() -> dict:
     """显式 PATH：把 CLI 所在目录放在最前，杜绝 PATH 漂移。"""
     env = dict(os.environ)
@@ -60,7 +67,7 @@ def _sync_codex_config() -> None:
     temp_path.replace(home / "config.toml")
 
 
-def _parse_claude_stream(raw: str):
+def _parse_claude_stream(raw: str, *, allow_partial=False):
     """解析 claude -p --output-format stream-json 的 JSONL → (最终文本, 轨迹)。"""
     trace, final = [], None
     saw_json = False
@@ -91,12 +98,14 @@ def _parse_claude_stream(raw: str):
             final = d.get("result") or ""
             if d.get("num_turns"):
                 trace.append({"t": "meta", "text": f"共 {d['num_turns']} 轮"})
+    if allow_partial and saw_json and final is None:
+        return '', trace
     if not saw_json or final is None:
         return raw, None
     return final, trace
 
 
-def _parse_codex_stream(raw: str):
+def _parse_codex_stream(raw: str, *, allow_partial=False):
     """解析 codex exec --json 的 JSONL → (最终文本, 轨迹)。
     兼容两种事件形态：新版 thread/item 流 和 旧版 msg 包装。宽容解析，认不出就当纯文本。"""
     trace, finals, saw_json = [], [], False
@@ -134,13 +143,16 @@ def _parse_codex_stream(raw: str):
             if usage.get("total_tokens") or usage.get("input_tokens"):
                 n = usage.get("total_tokens") or usage.get("input_tokens")
                 trace.append({"t": "meta", "text": f"tokens: {n}"})
+    if allow_partial and saw_json and not finals:
+        return '', trace
     if not saw_json or not finals:
         return raw, None
     return "\n".join(finals), trace
 
 
 def run_claude(workdir: Path, prompt_file: Path, model: str = "", *,
-               timeout: int = 900, max_turns: int = 40, allowed_tools: str = "Read,Grep,Glob"):
+               timeout: int | None = None, max_turns: int = 40, allowed_tools: str = "Read,Grep,Glob"):
+    timeout = config.REVIEW_AGENT_TIMEOUT_SECONDS if timeout is None else timeout
     if not claude_available():
         raise ReviewerError(
             f"claude CLI 未找到（启动时的 PATH={os.environ.get('PATH', '')[:300]}）；"
@@ -151,8 +163,13 @@ def run_claude(workdir: Path, prompt_file: Path, model: str = "", *,
     model = model or config.get_claude_model()
     if model:
         cmd += ["--model", model]
-    r = run_grouped(cmd, cwd=workdir, env=_subprocess_env(), timeout=timeout,
-                    stdin=subprocess.DEVNULL)
+    env=_subprocess_env()
+    env['DISABLE_AUTOUPDATER']='1'  # 仅 Hub 子进程，避免验证过程中自行替换执行器。
+    try:
+        r = run_grouped(cmd, cwd=workdir, env=env, timeout=timeout,
+                        stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired as exc:
+        raise _timeout_error(exc, _parse_claude_stream, 'Claude') from exc
     if r.returncode != 0:
         raise ReviewerError(f"claude 退出码 {r.returncode}：{(r.stderr or r.stdout)[-500:]}")
     text, trace = _parse_claude_stream(r.stdout)
@@ -162,7 +179,8 @@ def run_claude(workdir: Path, prompt_file: Path, model: str = "", *,
 
 
 def run_codex(workdir: Path, prompt_file: Path, model: str = "", *,
-              timeout: int = 900, skip_git_check: bool = False):
+              timeout: int | None = None, skip_git_check: bool = False):
+    timeout = config.REVIEW_AGENT_TIMEOUT_SECONDS if timeout is None else timeout
     if not codex_available():
         raise ReviewerError(
             f"codex CLI 未找到（启动时的 PATH={os.environ.get('PATH', '')[:300]}）")
@@ -179,7 +197,10 @@ def run_codex(workdir: Path, prompt_file: Path, model: str = "", *,
     model = model or config.get_kimi_model()
     if model:
         cmd = cmd[:1] + ["--model", model] + cmd[1:]
-    r = run_grouped(cmd, cwd=workdir, env=env, timeout=timeout, stdin=subprocess.DEVNULL)
+    try:
+        r = run_grouped(cmd, cwd=workdir, env=env, timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired as exc:
+        raise _timeout_error(exc, _parse_codex_stream, 'Kimi CLI') from exc
     if r.returncode != 0:
         raise ReviewerError(f"codex 退出码 {r.returncode}：{(r.stderr or r.stdout)[-500:]}")
     text, trace = _parse_codex_stream(r.stdout)

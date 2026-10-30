@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from app.engine import gates
+from app.engine import gates, reviewers, verdict
 from app import config, git_auth, processes, worker
 
 
@@ -21,6 +21,37 @@ class GateIntegrityTest(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_timeout_keeps_partial_tools_without_turning_them_into_final_output(self):
+        streams = [
+            (reviewers._parse_claude_stream, {'type':'assistant','message':{'content':[
+                {'type':'tool_use','name':'Read','input':{'file_path':'app/github.py'}}]}}),
+            (reviewers._parse_codex_stream, {'type':'item.started','item':{
+                'type':'command_execution','command':'rg classify_reviews app/github.py'}}),
+        ]
+        for parser, event in streams:
+            with self.subTest(parser=parser.__name__):
+                raw=json.dumps(event)+'\n{"incomplete'
+                error=reviewers._timeout_error(
+                    subprocess.TimeoutExpired(['cli','private prompt'],900,output=raw),parser,'真实模型')
+                self.assertEqual(error.trace[0]['t'],'tool')
+                self.assertIn('github.py',error.trace[0]['detail'])
+                self.assertNotIn('private prompt',str(error))
+                output, _=parser(raw)
+                self.assertIsNone(verdict.extract_findings(output))
+
+    def test_agent_default_budget_is_configurable_and_explicit_diagnostic_budget_wins(self):
+        prompt=self.root/'prompt.txt';prompt.write_text('private prompt')
+        done=subprocess.CompletedProcess(['cli'],0,'plain final response','')
+        with patch.object(reviewers,'claude_available',return_value=True), \
+             patch.object(config,'CLAUDE_BIN','claude'), \
+             patch.object(config,'REVIEW_AGENT_TIMEOUT_SECONDS',1800), \
+             patch.object(reviewers,'run_grouped',return_value=done) as run:
+            reviewers.run_claude(self.root,prompt)
+            self.assertEqual(run.call_args.kwargs['timeout'],1800)
+            self.assertEqual(run.call_args.kwargs['env']['DISABLE_AUTOUPDATER'],'1')
+            reviewers.run_claude(self.root,prompt,timeout=20)
+            self.assertEqual(run.call_args.kwargs['timeout'],20)
 
     def test_declared_gate_fails_when_runner_is_missing(self):
         with patch.object(gates, "_run_host", side_effect=FileNotFoundError()):
@@ -90,10 +121,11 @@ class GateIntegrityTest(unittest.TestCase):
     def test_timeout_error_does_not_echo_prompt_arguments(self):
         marker = "PRIVATE_REVIEW_PROMPT_MARKER"
         with self.assertRaises(subprocess.TimeoutExpired) as raised:
-            processes.run_grouped([sys.executable, "-c", "import time; time.sleep(2)", marker],
+            processes.run_grouped([sys.executable, "-c", "import time; print('review started',flush=True); time.sleep(2)", marker],
                                   cwd=self.root, env=os.environ.copy(), timeout=0.05)
         self.assertNotIn(marker, str(raised.exception))
         self.assertEqual(raised.exception.cmd, [sys.executable])
+        self.assertIn('review started', raised.exception.output)
 
     def test_gate_cannot_pass_with_detached_background_child(self):
         marker = self.root / "background.txt"

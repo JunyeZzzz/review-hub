@@ -123,11 +123,32 @@ def build(workdir: Path, intent: str = "", profile: str = "", diff_spec: str = "
     ), encoding="utf-8")
     names = subprocess.run(['git', 'diff', '--name-only', '-z', effective_spec], cwd=workdir,
                            capture_output=True, text=True, check=True).stdout
+    changed_files = [name for name in names.split('\0') if name]
+    part_paths = _part_paths(lines, parts, changed_files)
     return {"prompt_file": prompt_file, "diff_file": diff_file,
-            "changed_files": [name for name in names.split('\0') if name],
+            "changed_files": changed_files, 'review_part_paths':part_paths,
             "diff_lines": len(lines), "truncated": False,
             "review_parts": part_files,
             "intent": intent, "profile": profile}
+
+
+def _part_paths(lines, parts, changed_files):
+    """Git 同一 diff 的路径顺序与文件块一一对应，避免自行解码带空格/中文的 header。"""
+    index=-1;line_paths=[]
+    for line in lines:
+        if line.startswith('diff --git '):index+=1
+        if index<0 or index>=len(changed_files):
+            raise RuntimeError('无法将完整 diff 与变更路径对应，不能省略策略范围校验')
+        line_paths.append(changed_files[index])
+    if index+1!=len(changed_files):
+        raise RuntimeError('diff 文件块与路径数量不一致，不能省略策略范围校验')
+    offset=0;result=[]
+    for part in parts:
+        count=len(part.splitlines())-int(part.startswith('# Review Hub 续片：'))
+        result.append(list(dict.fromkeys(line_paths[offset:offset+count])))
+        offset+=count
+    if offset!=len(lines):raise RuntimeError('分片路径映射未覆盖完整 diff')
+    return result
 
 
 def _review_parts(lines: list[str]) -> list[str]:

@@ -20,6 +20,7 @@ const IMP_RESULT = {
   miss: "漏报",
   fp: "误报重现",
   error: "执行错误",
+  not_run: "未运行",
 };
 
 function improvementWorkbenchHtml(d) {
@@ -179,6 +180,44 @@ function imSourceHtml(f) {
     <small>${esc(imFeedbackState(f))} · ${fmtTime(f.updated_at)}</small></article>`;
 }
 
+function imCompactSourceHtml(f) {
+  return `<details class="im-source-fold"><summary><small>反馈 #${f.id} · ${f.disposition === "confirmed" ? "真实问题" : "误报"}</small><strong>${esc(f.finding.title)}</strong></summary>${imSourceHtml(f)}</details>`;
+}
+
+function imEventHtml(e) {
+  const labels = {
+    analysis_started: "开始分析",
+    analysis_finished: "分析完成",
+    analysis_failed: "分析失败",
+    comparison_reviewed: "核对通过",
+    comparison_corrected: "纠正匹配判定",
+    created: "建立候选",
+    edited: "编辑版本",
+    validation_started: "开始验证",
+    validation_finished: "验证完成",
+    validation_failed: "验证失败",
+    validation_resumed: "继续未完成验证",
+    adopted: "采用生效",
+    revoked: "撤销生效",
+    feedback_changed: "来源反馈变化",
+    analysis_evidence_recovered: "补全真实核查证据",
+    execution_evidence_recovered: "补全真实执行证据",
+    baseline_contract_recorded: "锁定真实基线契约",
+    adoption_policy_reassessed: "复核采用规则",
+    baseline_checkpoint_recovered: "恢复完整基线检查点",
+    parser_reprocessed: "重新解析真实模型回复",
+    code_regressions_added: "历史反馈已加入代码回归",
+    interrupted: "任务中断",
+  };
+  const d = e.detail;
+  const message =
+    d.message ||
+    (d.instruction
+      ? "候选内容已保存，展开查看这次修改"
+      : `${d.cases || ""} 条样本 · ${d.executions || ""} 次执行`);
+  return `<article><small>${fmtTime(e.created_at)}</small><strong>${labels[e.action] || esc(e.action)}</strong><p>${esc(message)}</p>${d.instruction ? `<details><summary>查看这次候选修改</summary><pre class="im-raw">${esc(JSON.stringify({ title: d.title, kind: d.kind, scope: d.scope, rationale: d.rationale, instruction: d.instruction, evidence: d.evidence, feedback_ids: d.feedback_ids }, null, 2))}</pre></details>` : ""}${d.test_links?.length ? `<details><summary>关联的可执行回归 · ${d.test_links.length}</summary>${d.test_links.map((t) => `<p class="small">反馈 #${t.feedback_id} · ${esc(t.scenario)}<br><code>${esc(t.path)}</code><br>原提交复现失败 → 当前树通过</p>`).join("")}</details>` : ""}${imAnalysisEvidenceHtml(d)}</article>`;
+}
+
 function imOpenFeedback(fid) {
   clearTimeout(improvePoll);
   improveSelection = `f${fid}`;
@@ -301,7 +340,7 @@ function imEditor(item, ids) {
     `<div class="im-detail-head"><div><span class="wb-eyebrow">${item ? `改进 #${item.id} / 新版本` : "从反馈形成项目改进"}</span><h2>${item ? "编辑候选改进" : "建立候选改进"}</h2></div></div>
     <form id="im-candidate-form"><label>改进名称<input name="title" required maxlength="160" value="${esc(item?.title || "")}" placeholder="例如：检查权限前追踪统一鉴权入口"></label>
     <div class="im-choice-row"><button type="button" data-im-kind="check" class="${item?.kind !== "knowledge" ? "on" : ""}">核验步骤</button><button type="button" data-im-kind="knowledge" class="${item?.kind === "knowledge" ? "on" : ""}">项目知识</button></div>
-    <div class="im-form-grid"><label>适用的仓库路径<input name="scope" required maxlength="1000" value="${esc(item?.scope || first?.finding.file || "*")}" placeholder="app/*,tests/*"><small>逗号分隔的路径 glob；* 表示本项目全部路径。</small></label>
+    <div class="im-form-grid"><label>适用的仓库路径<input name="scope" required maxlength="1000" value="${esc(item?.scope || first?.finding.file || "*")}" placeholder="app/**,tests/**"><small>逗号分隔；app/* 仅一层，app/** 含子目录，单独 * 为整个项目。</small></label>
     <label>为什么需要这项改进？<textarea name="rationale" required maxlength="3000" rows="3">${esc(item?.rationale || first?.reason || "")}</textarea></label></div>
     <label>后续审查应执行什么？<textarea name="instruction" required maxlength="5000" rows="4" placeholder="写清核验顺序、成立条件和仍应报告的例外；避免‘这类问题一律不报’">${esc(item?.instruction || "")}</textarea></label>
     <label>可核实的证据线索<textarea name="evidence" required maxlength="3000" rows="2">${esc(item?.evidence || first?.evidence || "")}</textarea></label>
@@ -376,17 +415,20 @@ async function imOpenItem(iid, quiet = false) {
           : item.status === "active"
             ? 4
             : 0;
+    const changeHtml = `<details class="im-section" ${!v || v.stale ? "open" : ""}><summary>具体改变 · ${esc(item.scope)}</summary><p class="small muted">${item.context_version === "per-part-v2" ? "按相关文件提供知识 · 仅进入匹配分片，完整代码仍全部审查" : "旧版输入契约 · 匹配后向全部分片提供；编辑后重新验证"}</p><div class="im-change-grid"><div><span>反馈揭示的原因</span><p>${esc(item.rationale)}</p></div><div><span>采用后的审查要求</span><p>${esc(item.instruction)}</p></div></div><div class="im-evidence-note"><b>核验线索</b><p>${esc(item.evidence)}</p></div></details>`;
+    const comparisonHtml = `<section class="im-section"><div class="im-section-head"><h3>当前策略 vs 候选策略</h3><span class="small muted">同一提交 · 同一配置 · 成对执行</span></div>${item.status === "analyzing" ? '<div class="im-running">◌ 正在原提交核查反馈并起草候选，尚未进入验证…</div>' : imValidationHtml(v, item.status !== "active")}${imRemainingHtml(v)}</section>`;
+    const usesHtml = `<section class="im-section"><div class="im-section-head"><h3>生效后的实际使用</h3><span class="small muted">最近 ${item.uses.length} 次</span></div>${item.uses.length ? `<div class="im-use-list">${item.uses.map((u) => `<a href="#/runs/${u.run_id}"><b>报告 #${u.run_id}</b><span>使用 v${u.revision} · ${STATUS_LABEL[u.status] || esc(u.status)}</span><small>${fmtTime(u.created_at)}</small></a>`).join("")}</div><p class="small muted">这些记录证明策略被选用，不代表该次所有问题都由它改善。</p>` : '<p class="im-empty">尚无正式审查使用记录；采用后只在匹配路径的审查中使用。</p>'}
+      ${item.followup.length ? `<details><summary>使用后的人工反馈 · ${item.followup.length} 条</summary>${item.followup.map((f) => `<a class="im-followup" href="#/runs/${f.run_id}">${f.disposition === "confirmed" ? "真实问题" : "误报"} · ${esc(f.finding.title)} · #${f.run_id}</a>`).join("")}<p class="small muted">用于观察是否再犯，尚未自动归因到某项策略。</p></details>` : ""}</section>`;
     $("im-main").innerHTML =
       `<div class="im-detail-head"><div><span class="wb-eyebrow">改进 #${item.id} / v${item.revision} / ${IMP_KIND[item.kind]}</span><h2>${esc(item.title)}</h2></div>${imStatus(item.status)}</div>
       <div class="im-lifecycle">${["反馈依据", "候选修改", "对照验证", "采用决策", "实际生效"].map((l, n) => `<div class="${n < stage ? "done" : n === stage ? "current" : ""}"><i>${n < stage ? "✓" : n + 1}</i><span>${l}</span></div>`).join("")}</div>
       ${item.status === "active" && !item.effective ? '<p class="im-warning">采用后的模型、规则或项目配置已变化，本项已暂停用于新审查。先撤销，再重新验证和采用。</p>' : ""}<div class="im-action-bar">${!["active", "validating", "analyzing"].includes(item.status) ? `<button class="ghost" id="im-edit">编辑候选</button><button class="${item.status === "ready" && !v?.stale ? "ghost" : "primary"}" id="im-validate">运行对照验证</button>` : ""}
+      ${v?.status === "failed" && !v.stale ? '<button class="primary" id="im-resume">继续未完成验证</button>' : ""}
       ${item.status === "ready" && v?.review_note ? `<button class="primary" id="im-adopt" ${v?.stale || !v?.review_note ? "disabled" : ""}>采用此版本</button>` : ""}
       ${item.status === "ready" && !v?.stale && !v?.review_note ? '<button class="primary" id="im-review">核对结果并确认</button>' : ""}
+      ${v?.status === "done" && v.snapshot.adoption_policy === "all-hit-v1" && !v.stale && item.status !== "active" ? '<button class="ghost" id="im-reassess">按增量规则复核</button>' : ""}
       ${item.status === "active" ? '<button class="danger-ghost" id="im-revoke">撤销生效</button>' : ""}<span class="small muted">${item.status === "active" ? "后续审查按适用路径选择；已开始的审查保留原快照" : item.status === "validating" ? "候选尚未用于正式审查" : "只影响本项目，公共规则不变"}</span></div>
-      <section class="im-section"><div class="im-section-head"><h3>具体改变</h3><code>${esc(item.scope)}</code></div><div class="im-change-grid"><div><span>反馈揭示的原因</span><p>${esc(item.rationale)}</p></div><div><span>采用后的审查要求</span><p>${esc(item.instruction)}</p></div></div><div class="im-evidence-note"><b>核验线索</b><p>${esc(item.evidence)}</p></div></section>
-      <section class="im-section"><div class="im-section-head"><h3>当前策略 vs 候选策略</h3><span class="small muted">同一提交 · 同一配置 · 成对执行</span></div>${item.status === "analyzing" ? '<div class="im-running">◌ 正在原提交核查反馈并起草候选，尚未进入验证…</div>' : imValidationHtml(v, item.status !== "active")}</section>
-      <section class="im-section"><div class="im-section-head"><h3>生效后的实际使用</h3><span class="small muted">最近 ${item.uses.length} 次</span></div>${item.uses.length ? `<div class="im-use-list">${item.uses.map((u) => `<a href="#/runs/${u.run_id}"><b>报告 #${u.run_id}</b><span>使用 v${u.revision} · ${STATUS_LABEL[u.status] || esc(u.status)}</span><small>${fmtTime(u.created_at)}</small></a>`).join("")}</div><p class="small muted">这些记录证明策略被选用，不代表该次所有问题都由它改善。</p>` : '<p class="im-empty">尚无正式审查使用记录；采用后只在匹配路径的审查中使用。</p>'}
-      ${item.followup.length ? `<details><summary>使用后的人工反馈 · ${item.followup.length} 条</summary>${item.followup.map((f) => `<a class="im-followup" href="#/runs/${f.run_id}">${f.disposition === "confirmed" ? "真实问题" : "误报"} · ${esc(f.finding.title)} · #${f.run_id}</a>`).join("")}<p class="small muted">用于观察是否再犯，尚未自动归因到某项策略。</p></details>` : ""}</section>
+      ${item.status === "active" ? usesHtml + comparisonHtml + changeHtml : (v && !v.stale) || item.status === "analyzing" ? comparisonHtml + changeHtml + usesHtml : changeHtml + comparisonHtml + usesHtml}
       <details class="im-section"><summary>历次验证记录 · ${item.validations.length}</summary>${
         item.validations
           .slice(1)
@@ -397,11 +439,27 @@ async function imOpenItem(iid, quiet = false) {
           .join("") || '<p class="im-empty">没有更早的验证。</p>'
       }</details>`;
     $("im-evidence").innerHTML =
-      `<h3>来源反馈 · ${sources.length}</h3>${sources.map(imSourceHtml).join("")}<h3 class="im-history-title">操作历史</h3><div class="im-timeline">${item.events.map((e) => `<article><small>${fmtTime(e.created_at)}</small><strong>${{ analysis_started: "开始分析", analysis_finished: "分析完成", analysis_failed: "分析失败", comparison_reviewed: "人工核对通过", comparison_corrected: "纠正匹配判定", created: "建立候选", edited: "编辑版本", validation_started: "开始验证", validation_finished: "验证完成", validation_failed: "验证失败", adopted: "采用生效", revoked: "撤销生效", feedback_changed: "来源反馈变化", interrupted: "任务中断" }[e.action] || esc(e.action)}</strong><p>${esc(e.detail.message || e.detail.instruction || `${e.detail.cases || ""} 条样本 · ${e.detail.executions || ""} 次执行`)}</p></article>`).join("")}</div>`;
+      `<h3>来源反馈 · ${sources.length}</h3>${sources.map(imCompactSourceHtml).join("")}<h3 class="im-history-title">操作历史</h3><div class="im-timeline">${item.events.map(imEventHtml).join("")}</div>`;
+    $("im-reassess")?.addEventListener("click", async () => {
+      const note = await uiPrompt("复核采用规则", {
+        message:
+          "来源完成且有改善、已有正确结果不得退化、执行无错误；遗留漏报仍列为待改进。说明此次复核依据，原始模型输出与结果不改写。",
+      });
+      if (!note) return;
+      try {
+        await api(`/api/improvement-validations/${v.id}/reassess`, {
+          method: "POST",
+          body: { note },
+        });
+        imOpenItem(iid);
+      } catch (e) {
+        toast(e.message, true);
+      }
+    });
     $("im-review")?.addEventListener("click", async () => {
       const note = await uiPrompt("核对对照结果", {
         message:
-          "展开逐项结果，核实真实问题仍被报出、误报消失，说明你的核对依据。确认后才能采用。",
+          "展开逐项结果，核实来源问题已解决、已有正确结果不退化，并明确仍未解决的样本，说明你的核对依据。确认后才能采用。",
       });
       if (!note) return;
       try {
@@ -448,6 +506,28 @@ async function imOpenItem(iid, quiet = false) {
           }
         }),
     );
+    document
+      .querySelectorAll("[data-im-remaining]")
+      .forEach(
+        (b) => (b.onclick = () => imOpenFeedback(+b.dataset.imRemaining)),
+      );
+    $("im-resume")?.addEventListener("click", async () => {
+      if (
+        !(await uiConfirm(
+          "仅沿用本轮完整成功的已完成侧；未完成侧重新调用。配置、反馈或样本变化后不能续跑，原失败原因继续保留。",
+          "继续验证",
+        ))
+      )
+        return;
+      try {
+        await api(`/api/improvement-validations/${v.id}/resume`, {
+          method: "POST",
+        });
+        imOpenItem(iid);
+      } catch (e) {
+        toast(e.message, true);
+      }
+    });
     $("im-edit")?.addEventListener("click", () =>
       imEditor(item, item.feedback_ids),
     );
@@ -503,22 +583,29 @@ function imValidationHtml(v, editable = false) {
     return '<div class="im-empty">尚未验证。需要正例保护真实问题、负例检查误报，并至少有一条未参与起草的保护样本。</div>';
   const p = v.progress || {},
     labels = { baseline: "当前策略", candidate: "候选策略" };
-  const improved = v.results.filter(
+  const completed = v.results.filter(
+    (r) => r.baseline.result !== "not_run" && r.candidate.result !== "not_run",
+  );
+  const improved = completed.filter(
     (r) => r.baseline.result !== "hit" && r.candidate.result === "hit",
   ).length;
-  const regressed = v.results.filter(
-    (r) => r.baseline.result === "hit" && r.candidate.result !== "hit",
+  const regressed = completed.filter(
+    (r) =>
+      r.baseline.result === "hit" &&
+      ["miss", "fp", "error"].includes(r.candidate.result),
   ).length;
   const errors = v.results.filter(
     (r) => r.baseline.result === "error" || r.candidate.result === "error",
   ).length;
-  return `<div class="im-validation-summary"><span class="im-status ${v.status === "running" ? "validating" : v.eligible ? "ready" : "needs_changes"}">${v.status === "running" ? "验证中" : v.status === "failed" ? "验证失败" : v.eligible ? "达到采用条件" : "未达到采用条件"}</span><span>改善 <b>${improved}</b></span><span>退化 <b>${regressed}</b></span><span>执行错误 <b>${errors}</b></span></div>
+  return `<div class="im-validation-summary"><span class="im-status ${v.status === "running" ? "validating" : v.eligible ? "ready" : "needs_changes"}">${v.status === "running" ? "验证中" : v.status === "failed" ? "验证失败" : v.eligible ? "达到采用条件" : "未达到采用条件"}</span><span>改善 <b>${improved}</b></span><span>退化 <b>${regressed}</b></span><span>执行错误 <b>${errors}</b></span>${v.results.some((r) => r.baseline.reused_from_validation) ? `<span>基线复用 ${v.results.filter((r) => r.baseline.reused_from_validation).length} 个样本</span>` : ""}</div>
+    ${!v.review_note ? '<p class="im-method-note">以下为自动匹配结果，尚未核对；标题变化可能造成假漏报，请展开原始输出确认。</p>' : ""}
     ${v.stale ? '<p class="im-warning">配置、样本或反馈已变化；此结果不能用于采用，请重新验证。</p>' : ""}
     ${v.review_note ? `<p class="im-review-note">✓ 已人工核对：${esc(v.review_note)}</p>` : ""}
     ${v.error ? `<p class="im-warning">${esc(v.error)}</p>` : ""}
-    ${v.status === "running" ? `<div class="im-running"><div class="qa-progress"><i style="width:${Math.round(((p.done || 0) / (p.total || 1)) * 100)}%"></i></div><strong>${p.done || 0} / ${p.total || v.snapshot.cases.length} 条完成</strong><span>${labels[p.arm] || "准备"} · 样本 #${p.case_id || "—"} · ${esc(p.stage || "等待开始")}</span>${(p.trace || []).map((t) => `<small>${t.status === "ok" ? "✓" : t.status === "fail" ? "×" : "◌"} ${esc(t.name)}</small>`).join("")}</div>` : ""}
-    <div class="im-pairs">${v.results.map((r) => `<details class="im-pair"><summary><span class="im-sample-type">${r.polarity === "positive" ? "应报出" : "不应报"} · ${r.source ? "来源" : "保护"}</span><strong>${esc(r.expected.title)}</strong><span>${IMP_RESULT[r.baseline.result]} → ${IMP_RESULT[r.candidate.result]}</span></summary>${editable && v.status === "done" && !v.stale ? `<div style="padding:8px 12px"><button class="ghost small-btn" data-im-correct="${r.case_id}">纠正匹配判定</button>${r.human_judgement ? `<p class="small muted">人工纠正：${esc(r.human_judgement)}</p>` : ""}</div>` : ""}<p class="im-pair-expected">预期：${esc(r.expected.file)}:${r.expected.line || "—"} · ${esc(r.expected.condition || r.expected.title)}</p><div class="im-pair-columns">${["baseline", "candidate"].map((arm) => `<div><h4>${labels[arm]} · ${IMP_RESULT[r[arm].result]}</h4>${r[arm].machine_result ? `<small>原自动判定：${IMP_RESULT[r[arm].machine_result]}</small>` : ""}<p>${esc(r[arm].detail)}</p>${(r[arm].actual || []).map((a) => `<article><b>${esc(a.title)}</b><code>${esc(a.file)}:${a.line}</code><p>${esc(a.condition || "")}</p></article>`).join("") || '<p class="muted">没有发现</p>'}<small>使用改进：${(r[arm].improvements || []).map((i) => `#${i.id} v${i.revision}`).join("、") || "无"}</small><details><summary>完整评审输出</summary>${(r[arm].reviews || []).map((out) => `<h4>${esc(out.name)}</h4><pre class="im-raw">${esc(out.output)}</pre>`).join("") || "<p>本轮未产生评审输出</p>"}</details><details><summary>执行阶段</summary>${(r[arm].steps || []).map((s) => `<p class="small">${esc(s.status)} · ${esc(s.name)}</p>`).join("")}</details></div>`).join("")}</div></details>`).join("") || '<p class="im-empty">逐样本对照结果将实时保存在这里。</p>'}</div>
-    ${v.status === "done" && !v.eligible ? '<p class="im-warning">采用要求：来源样本至少一条从错变对；候选侧全部符合预期；基线无执行错误。没有观察到改善时，不宣称改进有效。</p>' : ""}
+    ${v.status === "running" ? `<div class="im-running"><div class="qa-progress"><i style="width:${Math.round(((p.done || 0) / (p.total || 1)) * 100)}%"></i></div><strong>${p.done || 0} / ${p.total || v.snapshot.cases.length} 条完成</strong><span>${labels[p.arm] || "准备"} · 样本 #${p.case_id || "—"} · ${esc(p.stage || "等待开始")}</span>${(p.trace || []).map((t) => `<small>${t.status === "ok" ? "✓" : t.status === "fail" ? "×" : t.status === "skip" ? "—" : "◌"} ${esc(t.name)}${t.part ? ` · 完成 ${t.part.done ?? 0}/${t.part.total} · 运行 ${(t.part.running || []).join("、") || "无"} · 排队 ${t.part.queued || 0}${t.part.failed?.length ? ` · 失败 ${t.part.failed.join("、")}` : ""}` : ""}</small>`).join("")}</div>` : ""}
+    <div class="im-pairs">${v.results.map((r) => `<details class="im-pair"><summary><span class="im-sample-type">${r.polarity === "positive" ? "应报出" : "不应报"} · ${r.source ? "来源" : "保护"}</span><strong>${esc(r.expected.title)}</strong><span>${IMP_RESULT[r.baseline.result]} → ${IMP_RESULT[r.candidate.result]}</span></summary>${editable && v.status === "done" && !v.stale ? `<div style="padding:8px 12px"><button class="ghost small-btn" data-im-correct="${r.case_id}">纠正匹配判定</button>${r.human_judgement ? `<p class="small muted">人工纠正：${esc(r.human_judgement)}</p>` : ""}</div>` : ""}<p class="im-pair-expected">预期：${esc(r.expected.file)}:${r.expected.line || "—"} · ${esc(r.expected.condition || r.expected.title)}</p><div class="im-pair-columns">${["baseline", "candidate"].map((arm) => `<div><h4>${labels[arm]} · ${IMP_RESULT[r[arm].result]}</h4>${r[arm].machine_result ? `<small>原自动判定：${IMP_RESULT[r[arm].machine_result]}</small>` : ""}<p>${esc(r[arm].detail)}</p>${r[arm].reused_from_validation ? `<small>原验证 #${r[arm].reused_from_validation} · 原样本 #${r[arm].original_case_id} · ${fmtTime(r[arm].collected_at)}${r[arm].reused_from_improvement ? ` · 改进 #${r[arm].reused_from_improvement}` : ""}</small>` : ""}${r[arm].prior_human_judgement ? `<p class="small muted">沿用原样本核对依据：${esc(r[arm].prior_human_judgement)}</p>` : ""}${r[arm].continued_from_validation ? "<small>沿用本轮已完成侧；不是新的模型调用</small>" : ""}${imActualFindingsHtml(r[arm], r.expected)}<small>使用改进：${(r[arm].improvements || []).map((i) => `#${i.id} v${i.revision}`).join("、") || "无"}</small><details><summary>完整评审输出</summary>${(r[arm].reviews || []).map((out) => `<h4>${esc(out.name)}</h4><pre class="im-raw">${esc(out.output)}</pre>${out.evidence_id ? `<button class="ghost small-btn" data-im-evidence="${esc(out.evidence_id)}">查看工具轨迹与输入证据</button><div data-im-evidence-body></div>` : ""}`).join("") || "<p>本轮未产生评审输出</p>"}</details><details><summary>执行阶段</summary>${(r[arm].steps || []).map((s) => `<p class="small">${esc(s.status)} · ${esc(s.name)}</p>${s.command ? `<code>${esc(s.command)}</code>` : ""}${s.detail ? `<pre class="im-raw">${esc(s.detail)}</pre>` : ""}${s.trace?.length ? imAnalysisEvidenceHtml({ trace: s.trace }) : ""}`).join("")}</details></div>`).join("")}</div></details>`).join("") || '<p class="im-empty">逐样本对照结果将实时保存在这里。</p>'}</div>
+    ${v.status === "done" && v.snapshot.adoption_policy === "all-hit-v1" ? '<p class="im-method-note">本轮最初使用旧规则 all-hit-v1；若要按增量规则复核，将另行记录规则变更，原始结果保留。</p>' : ""}
+    ${v.status === "done" && !v.eligible ? '<p class="im-warning">采用要求：来源样本全部完成且至少一条改善；已有正确结果不退化；双方执行无错误。遗留问题继续列为待改进。</p>' : ""}
     <details class="im-snapshot"><summary>本轮输入快照 · #${v.id} / v${v.revision}</summary><pre class="im-raw">${esc(JSON.stringify(v.snapshot, null, 2))}</pre></details>
     <p class="im-method-note">当前匹配使用文件、相邻行号和标题相似度；对照不等于因果证明，单轮结果受模型波动影响。保护样本未参与本候选起草，不等于独立盲测集。</p>`;
 }
@@ -663,3 +750,68 @@ async function imMissedDialog() {
     toast(e.message, true);
   }
 }
+
+function imAnalysisEvidenceHtml(detail) {
+  if (!detail.output && !detail.trace?.length && !detail.prompt) return "";
+  return `<details><summary class="small">模型核查原文与工具轨迹</summary>${detail.output ? `<pre class="im-raw">${esc(detail.output)}</pre>` : ""}${(detail.trace || []).map((t) => `<p class="small">${esc(t.name || t.t)} · ${esc(t.detail || t.text || "")}</p>`).join("")}${detail.prompt ? `<details><summary class="small">本次核查输入</summary><pre class="im-raw">${esc(detail.prompt)}</pre></details>` : ""}</details>`;
+}
+
+function imRemainingHtml(v) {
+  if (!v || v.status !== "done") return "";
+  const unresolved = v.results.filter((r) =>
+    ["miss", "fp"].includes(r.candidate.result),
+  );
+  if (!unresolved.length) return "";
+  return `<div class="im-warning"><b>仍有 ${unresolved.length} 个已知样本待改进</b><p>采用一项有效改进不会把这些问题标为解决。逐项核对后，可继续建立下一项改进。</p>${unresolved
+    .map((r) => {
+      const c = v.snapshot.cases.find((c) => c.id === r.case_id);
+      const f = improveData.feedback.find(
+        (f) => f.run_id === c?.run_id && f.idx === c?.idx,
+      );
+      return `<div class="im-remaining-row"><span>${esc(r.expected.title)}</span>${f ? `<button class="ghost small-btn" data-im-remaining="${f.id}">继续改进 →</button>` : ""}</div>`;
+    })
+    .join("")}</div>`;
+}
+
+function imActualFindingsHtml(result, expected) {
+  const actual = result.actual || [];
+  if (!actual.length) return '<p class="muted">没有发现</p>';
+  const related = [],
+    other = [];
+  for (const a of actual) {
+    const near =
+      a.file === expected.file &&
+      Math.abs((+a.line || 0) - (+expected.line || 0)) <= 30;
+    (near ? related : other).push(a);
+  }
+  const render = (items) =>
+    items
+      .map(
+        (a) =>
+          `<article><b>${esc(a.title)}</b><code>${esc(a.file)}:${esc(a.line)}</code><p>${esc(a.condition || "")}</p>${a.fix ? `<details><summary>建议修法</summary><p>${esc(a.fix)}</p></details>` : ""}</article>`,
+      )
+      .join("");
+  return `<small>同文件相邻位置 · ${related.length} 条（需核对是否同一问题）</small>${related.length ? render(related) : '<p class="muted">没有同位置发现，可展开其他发现核对语义。</p>'}${other.length ? `<details><summary>其他发现 · ${other.length} 条 / 全部可查看</summary>${render(other)}</details>` : ""}`;
+}
+
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-im-evidence]");
+  if (!b) return;
+  b.disabled = true;
+  b.textContent = "读取证据…";
+  try {
+    const evidence = await api(`/api/review-evidence/${b.dataset.imEvidence}`);
+    b.nextElementSibling.innerHTML = imAnalysisEvidenceHtml({
+      trace: evidence.trace,
+      prompt: evidence.prompt,
+      output: "",
+    });
+    const box = b.nextElementSibling.querySelector("details");
+    if (box) box.open = true;
+    b.remove();
+  } catch (err) {
+    b.disabled = false;
+    b.textContent = "重试读取证据";
+    toast(err.message, true);
+  }
+});

@@ -209,6 +209,8 @@ def init() -> None:
     improvement_cols = {r[1] for r in c.execute('PRAGMA table_info(review_improvements)')}
     if 'activation_signature' not in improvement_cols:
         c.execute("ALTER TABLE review_improvements ADD COLUMN activation_signature TEXT NOT NULL DEFAULT ''")
+    if 'context_version' not in improvement_cols:
+        c.execute("ALTER TABLE review_improvements ADD COLUMN context_version TEXT NOT NULL DEFAULT 'whole-diff-v1'")
     for col, definition in (("current_case_id", "INTEGER"), ("current_stage", "TEXT"),
                             ("current_detail", "TEXT"), ("current_trace", "TEXT")):
         if col not in eval_cols:

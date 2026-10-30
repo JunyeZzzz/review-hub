@@ -48,14 +48,32 @@ PORT = int(os.environ.get("HUB_PORT", "7777"))
 
 # 并发审查 worker 数：不同项目工作目录分开；本机命令仍共享系统资源和用户权限。
 WORKER_CONCURRENCY = max(1, int(os.environ.get("WORKER_CONCURRENCY", "2")))
-# 每次交叉评审最多同时启动的 Agent/API 数；与跨项目 worker 并发相乘。
+# 交叉评审组和完整分片共享的全局模型调用上限；跨项目也共用此预算。
 REVIEW_CONCURRENCY = min(4, max(1, int(os.environ.get("REVIEW_CONCURRENCY", "4"))))
+REVIEW_CLI_CONCURRENCY = min(REVIEW_CONCURRENCY, max(1, int(os.environ.get("REVIEW_CLI_CONCURRENCY", "2"))))
+REVIEW_AGENT_TIMEOUT_SECONDS = min(3600, max(30, int(os.environ.get("REVIEW_AGENT_TIMEOUT_SECONDS", "1800"))))
 
 # CLI 绝对路径：启动时解析一次，避免运行期 PATH 漂移导致"时有时无"
 import shutil as _shutil  # noqa: E402
 
 CLAUDE_BIN = _shutil.which("claude") or ""
 CODEX_BIN = _shutil.which("codex") or ""
+
+
+def cli_identity() -> list[dict]:
+    """不执行 CLI 的文件身份；同版本重装、链接替换也需重新验证。"""
+    identities=[]
+    for provider,binary in (('claude',CLAUDE_BIN),('codex',CODEX_BIN)):
+        entry={'provider':provider,'path':str(Path(binary).resolve()) if binary else ''}
+        try:
+            stat=Path(binary).stat() if binary else None
+        except OSError:
+            stat=None
+        entry.update(mtime_ns=stat.st_mtime_ns if stat else None,
+                     size=stat.st_size if stat else None,inode=stat.st_ino if stat else None)
+        identities.append(entry)
+    return identities
+
 # 子进程显式 PATH：把 CLI 所在目录放最前面
 SUBPROCESS_PATH = os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin")
 if CLAUDE_BIN:

@@ -78,7 +78,7 @@ class WorkbenchQualityTest(unittest.TestCase):
         with patch.object(worker, "_ensure_clone"), patch.object(worker, "_git_retry"), \
              patch.object(worker, "get_pipeline", return_value=pipeline), \
              patch.object(prompts, "build", return_value={"diff_file": diff}), \
-             patch.object(gates, "run_tests", return_value={"status": "ok", "log": "passed"}), \
+             patch.object(gates, "run_tests", return_value={"status": "skip", "log": "没有测试入口"}), \
              patch.object(worker, "_run_reviewer_step", return_value=(answer, None, "prompt")):
             result = evaluator._run_case(case, lambda stage, trace: seen.append(stage))
         self.assertEqual(result["result"], "hit")
@@ -87,6 +87,8 @@ class WorkbenchQualityTest(unittest.TestCase):
         self.assertIn({"name": "独立评审 · A", "status": "ok"}, result["steps"])
         self.assertEqual(result["steps"][-1], {"name": "与人工答案比对", "status": "ok"})
         self.assertEqual(result["actual"][0]["title"], "空指针错误")
+        gate=next(s for s in result['steps'] if s['name']=='门禁 · 测试门禁')
+        self.assertEqual((gate['status'],gate['detail']),('skip','没有测试入口'))
 
     def test_eval_replays_original_push_range(self):
         source_run = db.execute(
@@ -132,6 +134,23 @@ class WorkbenchQualityTest(unittest.TestCase):
         self.assertIn({"name": "并行交叉评审", "status": "ok"}, result["steps"])
         self.assertIn({"name": "独立评审 · A", "status": "ok"}, result["steps"])
         self.assertIn({"name": "独立评审 · B", "status": "ok"}, result["steps"])
+
+        def partially_failed(step, *_args):
+            if step['name'] == 'B':
+                raise RuntimeError('provider timeout')
+            return ('```json\n{"findings":[{"file":"x.py","line":10,"title":"空指针错误"}]}\n```',
+                    [{'t':'tool','name':'Read','detail':'x.py'}], 'actual input')
+        with patch.object(worker, "_ensure_clone"), patch.object(worker, "_git_retry"), \
+             patch.object(worker, "get_pipeline", return_value=pipeline), \
+             patch.object(prompts, "build", return_value={"diff_file": diff}), \
+             patch.object(worker, "_run_reviewer_step", side_effect=partially_failed):
+            failed = evaluator._run_case(case)
+        self.assertEqual(failed['result'], 'error')
+        self.assertEqual([r['name'] for r in failed['reviews']], ['A'])
+        self.assertEqual(failed['actual'][0]['title'], '空指针错误')
+        from app import improvements
+        evidence = improvements.read_review_evidence(failed['reviews'][0]['evidence_id'])
+        self.assertEqual(evidence['prompt'], 'actual input')
 
     def test_eval_progress_persists_and_interrupted_run_is_visible(self):
         rid = db.execute("INSERT INTO eval_runs(status,cases_total,config_snapshot,created_at) VALUES('running',1,?,?)",

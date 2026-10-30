@@ -11,7 +11,7 @@ import httpx
 from fastapi import HTTPException
 
 from app import config, connections, db, main, worker
-from app.engine import api_nodes, prompts, verdict
+from app.engine import api_nodes, prompts, reviewers, verdict
 
 
 class PipelineNodesTest(unittest.TestCase):
@@ -111,7 +111,9 @@ class PipelineNodesTest(unittest.TestCase):
             path = self.root / f"part-{i}.patch"
             path.write_text(part)
             paths.append(path)
-        built = {"diff_file": full, "prompt_file": template, "review_parts": paths}
+        progress=[]
+        built = {"diff_file": full, "prompt_file": template, "review_parts": paths,
+                 'part_progress':lambda index,total,status:progress.append((index,total,status))}
         seen = []
         def review_part(step, prompt):
             seen.append(prompt)
@@ -121,18 +123,73 @@ class PipelineNodesTest(unittest.TestCase):
                 {"kind": "api", "model": "test"}, {}, self.root, built, full.read_text())
         self.assertEqual(len(seen), len(parts))
         self.assertEqual(verdict.extract_findings(output), [])
-        self.assertIn("unique_changed_line_9000", seen[-1])
+        self.assertTrue(any("unique_changed_line_9000" in prompt for prompt in seen))
+        self.assertEqual({i for i,total,status in progress if status=='ok'},set(range(1,len(parts)+1)))
+        self.assertEqual(len(progress),len(parts)*3)
         with patch.object(api_nodes, "run", side_effect=[
-                '```json\n{"findings": []}\n```', "无效输出"]):
-            with self.assertRaisesRegex(RuntimeError, "不能判定通过"):
+                '```json\n{"findings": []}\n```', "无效输出", *(['```json\n{"findings": []}\n```']*(len(parts)-2))]):
+            with self.assertRaisesRegex(RuntimeError, "不能判定通过") as failure:
                 worker._run_reviewer_step(
                     {"kind": "api", "model": "test"}, {}, self.root, built, full.read_text())
+        self.assertEqual(failure.exception.output,'无效输出')
+        self.assertTrue(any(status=='fail' for index,total,status in progress))
+
+    def test_parts_run_in_parallel_with_global_model_budget(self):
+        full=self.root/'full.patch';full.write_text('+++ b/x.py\n+one\n+two')
+        template=self.root/'prompt.txt';template.write_text(f'审查 {full}')
+        parts=[]
+        for index in range(2):
+            path=self.root/f'fragment-{index}.patch';path.write_text(f'+++ b/x.py\n+part{index}')
+            parts.append(path)
+        barrier=threading.Barrier(2,timeout=3)
+        lock=threading.Lock();active=0;peak=0
+        def call(step,prompt):
+            nonlocal active,peak
+            with lock:active+=1;peak=max(peak,active)
+            try:
+                barrier.wait()
+                return '```json\n{"findings":[]}\n```'
+            finally:
+                with lock:active-=1
+        with patch.object(worker,'_MODEL_SLOTS',threading.BoundedSemaphore(2)),patch.object(api_nodes,'run',side_effect=call):
+            output,_,actual=worker._run_reviewer_step({'kind':'api'},{},self.root,
+                {'diff_file':full,'prompt_file':template,'review_parts':parts},full.read_text())
+        self.assertEqual(peak,2)
+        self.assertEqual(verdict.extract_findings(output),[])
+        self.assertLess(actual.index('分片审查 1/2'),actual.index('分片审查 2/2'))
 
     def test_too_large_diff_is_rejected_before_review(self):
         with patch.object(prompts, "MAX_REVIEW_PARTS", 1), \
              patch.object(prompts, "MAX_REVIEW_PART_LINES", 2):
             with self.assertRaisesRegex(RuntimeError, "不能截断后判通过"):
                 prompts._review_parts(["one\n", "two\n", "three\n"])
+
+    def test_cli_provider_has_its_own_budget_within_global_slots(self):
+        full=self.root/'full.patch';full.write_text('+++ b/x.py\n+change')
+        prompt=self.root/'prompt';prompt.write_text(f'审查 {full}')
+        barrier=threading.Barrier(2,timeout=3)
+        lock=threading.Lock();active=0;peak=0;sent=[]
+        def call(*args):
+            nonlocal active,peak
+            sent.append(args[1].read_text())
+            with lock:active+=1;peak=max(peak,active)
+            try:
+                barrier.wait()
+                return '```json\n{"findings":[]}\n```',[]
+            finally:
+                with lock:active-=1
+        built={'diff_file':full,'prompt_file':prompt}
+        with patch.object(worker,'_MODEL_SLOTS',threading.BoundedSemaphore(4)), \
+             patch.object(worker,'_CLI_SLOTS',{'codex':threading.BoundedSemaphore(2)}), \
+             patch.object(reviewers,'run_codex',side_effect=call):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                jobs=[pool.submit(worker._run_reviewer_step,{'provider':'codex'},{},self.root,built,full.read_text())
+                      for _ in range(4)]
+                results=[job.result() for job in jobs]
+        self.assertEqual(peak,2)
+        self.assertEqual(len(results),4)
+        self.assertTrue(all('CLI 输入附件快照' not in text for text in sent))
+        self.assertTrue(all('CLI 输入附件快照' in result[2] and '+change' in result[2] for result in results))
 
     def test_chat_api_node_uses_bound_key_and_parses_text(self):
         cid = api_nodes.create("team-openai", "openai", "secret-123")
@@ -318,6 +375,21 @@ class PipelineNodesTest(unittest.TestCase):
                     future.result()
         self.assertEqual(len({path for path, _ in observed}), 2)
         self.assertEqual({"A", "B"}, {"A" if "侧重点\nA" in text else "B" for _, text in observed})
+
+    def test_failed_cross_review_preserves_completed_member_findings(self):
+        pid=db.execute("INSERT INTO projects(kind,full_name,name,created_at) VALUES('local','/tmp/repo','repo',?)",(db.now(),))
+        rid=db.execute("INSERT INTO runs(project_id,trigger,status,created_at) VALUES(?,'manual','running',?)",(pid,db.now()))
+        group={'reviewers':[{'id':'a','name':'A'},{'id':'b','name':'B'}]}
+        def execute(step,*args):
+            if step['id']=='b': raise RuntimeError('timeout')
+            return '```json\n{"findings":[{"severity":"Important","file":"a.py","line":1,"title":"真实问题"}]}\n```',None,'prompt'
+        with patch.object(worker,'_run_reviewer_step',side_effect=execute):
+            with self.assertRaisesRegex(RuntimeError,'timeout'):
+                worker._run_review_group(group,{},self.root,{},'',[],worker.StepLog(rid))
+        row=db.get('SELECT * FROM runs WHERE id=?',(rid,))
+        self.assertNotEqual(row['status'],'passed')
+        self.assertEqual(json.loads(row['findings_json'])[0]['title'],'真实问题')
+        self.assertEqual(row['important_count'],1)
 
     def test_reordering_reviewers_does_not_change_verdict_or_eval_fingerprint(self):
         a = ('A', '```json\n{"findings":[{"severity":"Important","file":"x.py","line":10,"title":"空指针错误"}]}\n```')

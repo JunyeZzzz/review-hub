@@ -212,6 +212,44 @@
   padding-bottom: 16px;
   margin-bottom: 16px;
 }
+.im-source-fold {
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 8px;
+  padding: 8px 0;
+}
+.im-source-fold > summary {
+  list-style: none;
+  cursor: pointer;
+  position: relative;
+  padding-right: 16px;
+}
+.im-source-fold > summary::-webkit-details-marker {
+  display: none;
+}
+.im-source-fold > summary::after {
+  content: "›";
+  position: absolute;
+  right: 1px;
+  top: 12px;
+  color: var(--muted);
+}
+.im-source-fold[open] > summary::after {
+  transform: rotate(90deg);
+}
+.im-source-fold > summary small {
+  color: var(--muted);
+  font-size: 10px;
+}
+.im-source-fold > summary strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.im-source-fold .im-source {
+  margin: 12px 0 0;
+  border: 0;
+}
 .im-source a {
   font-size: 11px;
 }
@@ -756,4 +794,21 @@
 .im-main textarea::placeholder,
 .rh-dialog textarea::placeholder {
   color: var(--faint);
+}
+.im-remaining-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+  border-top: 1px solid var(--line);
+  margin-top: 6px;
+}
+.im-remaining-row > span {
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.im-remaining-row button {
+  flex: none;
 }

@@ -1754,7 +1754,7 @@ function markButtonsHtml(run, f) {
     `<button class="ghost small-btn mark-btn${cur === val ? " on" : ""}"
        data-mark="${val}" data-run="${run.id}" data-idx="${f._idx}" data-cur="${esc(cur)}"
        title="${cur === val ? "再点一次撤销标记" : "标记为" + label}">${cur === val ? "✓ " : ""}${label}</button>`;
-  const evalBtn = (run.project_kind === "github" && f.severity === "IMPORTANT" && cur)
+  const evalBtn = (run.project_kind === "github" && ["IMPORTANT", "NIT"].includes(f.severity) && cur)
     ? `<button class="ghost small-btn" data-eval-run="${run.id}" data-eval-idx="${f._idx}"
         title="确认=应报出样本；误报=不应再报样本">存为样本</button>` : "";
   const progressBtn = cur ? `<button class="ghost small-btn" data-feedback-run="${run.id}" data-feedback-idx="${f._idx}">反馈进度 ↗</button>` : "";

@@ -10,6 +10,7 @@ import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from pathlib import Path
 
 from . import config, connections, db, github, improvements
@@ -104,6 +105,9 @@ def get_pipeline(project: dict | None = None) -> list:
 
 MAX_NODE_PROMPT_CHARS = 500_000
 MAX_NODE_OUTPUT_CHARS = 200_000
+_MODEL_SLOTS = threading.BoundedSemaphore(config.REVIEW_CONCURRENCY)
+_CLI_SLOTS = {provider:threading.BoundedSemaphore(config.REVIEW_CLI_CONCURRENCY)
+              for provider in ('claude','codex')}
 
 
 def _node_prompt(step: dict, built: dict, prior: list[dict], workdir: Path,
@@ -138,16 +142,31 @@ def _node_prompt(step: dict, built: dict, prior: list[dict], workdir: Path,
     return base
 
 
+class _PartCancelled(RuntimeError):
+    pass
+
+
+def _unparsed_review_error(output, trace, actual_input, label='评审器'):
+    error=reviewers.ReviewerError(f'{label} 未返回有效 findings JSON，不能判定通过；原始回复已保留')
+    error.output, error.trace, error.input_evidence = output, trace or [], actual_input
+    return error
+
+
 def _run_reviewer_step(step: dict, project: dict, workdir: Path,
                        built: dict, diff_text: str, prior: list[dict] | None = None):
-    """执行 Agent 或 API 节点，返回 (输出文本, 轨迹, 实际输入)。"""
+    """返回 (输出文本, 轨迹, 输入证据)；CLI 证据另附其读取文件，不追加给模型。"""
     prior = prior or []
     if step.get("purpose", "findings") != "context" and built.get("review_parts"):
         full_path = str(built["diff_file"])
         template = built["prompt_file"].read_text(encoding="utf-8")
         findings, traces, inputs, summaries = [], [], [], []
         total = len(built["review_parts"])
-        for index, path in enumerate(built["review_parts"], 1):
+        cancelled = threading.Event()
+        failures, failure_lock = [], threading.Lock()
+        def review_part(index, path):
+            notify = built.get('part_progress')
+            if notify:
+                notify(index, total, 'queued')
             part_prompt = workdir / f".hub-prompt-part-{index}-{uuid.uuid4().hex}.txt"
             part_prompt.write_text(template.replace(full_path, str(path)) +
                                    f"\n## 分片审查 {index}/{total}\n"
@@ -155,20 +174,53 @@ def _run_reviewer_step(step: dict, project: dict, workdir: Path,
                                    "此片段可能从文件或 diff 块中间开始，报告真实文件行号。"
                                    "不要因为其他片段不可见就断言整个变更没有问题。\n",
                                    encoding="utf-8")
-            part_built = {**built, "diff_file": path, "prompt_file": part_prompt, "review_parts": []}
-            output, trace, actual_input = _run_reviewer_step(
-                step, project, workdir, part_built, path.read_text(encoding="utf-8"), prior)
-            found = verdict.extract_findings(output)
-            if found is None:
-                raise RuntimeError(f"审查片段 {index}/{total} 未返回有效 findings JSON，不能判定通过")
-            findings.extend(found)
-            summaries.append(f"片段 {index}/{total}：{output.split('```json', 1)[0].strip()}")
-            if len(json.dumps({"findings": findings}, ensure_ascii=False)) > MAX_NODE_OUTPUT_CHARS:
-                raise RuntimeError(f"审查发现超过 {MAX_NODE_OUTPUT_CHARS} 字符上限，不能判定通过")
-            if trace:
-                traces.append({"t": "meta", "text": f"审查片段 {index}/{total}"})
-                traces.extend(trace)
-            inputs.append(f"[审查片段 {index}/{total}]\n{actual_input}")
+            part_built = {**built, "diff_file":path, "prompt_file":part_prompt, "review_parts":[],
+                          'part_index':index, 'part_total':total,'review_cancelled':cancelled}
+            items=built.get('applicable_improvements',[])
+            metadata=built.get('review_part_paths')
+            if any(i.get('context_version')=='per-part-v2' for i in items) and (not metadata or len(metadata)!=total):
+                raise RuntimeError('缺少完整分片路径元数据，不能确认改进适用范围')
+            selected=improvements.for_part(items,metadata[index-1] if metadata else [])
+            part_built.update(improvement_context=improvements.render(selected),
+                              applicable_improvements=selected,improvement_selected=selected)
+            try:
+                output, trace, actual_input = _run_reviewer_step(
+                    step, project, workdir, part_built, path.read_text(encoding="utf-8"), prior)
+                found = verdict.extract_findings(output)
+                if found is None:
+                    raise _unparsed_review_error(output,trace,actual_input,f'审查片段 {index}/{total}')
+            except Exception as exc:
+                if not isinstance(exc,_PartCancelled):
+                    with failure_lock:
+                        if not failures:failures.append(exc)
+                cancelled.set()
+                if notify:
+                    notify(index, total, 'fail')
+                raise
+            if notify:
+                notify(index, total, 'ok')
+            return output, trace, actual_input, found
+
+        with ThreadPoolExecutor(max_workers=min(total,config.REVIEW_CONCURRENCY),thread_name_prefix='hub-parts') as pool:
+            futures = [pool.submit(review_part,index,path) for index,path in enumerate(built['review_parts'],1)]
+            try:
+                # 按原始分片顺序汇总；完成先后不改变输出顺序。
+                for index, future in enumerate(futures,1):
+                    output, trace, actual_input, found = future.result()
+                    findings.extend(found)
+                    summaries.append(f"片段 {index}/{total}：{output.split('```json', 1)[0].strip()}")
+                    if len(json.dumps({"findings":findings},ensure_ascii=False)) > MAX_NODE_OUTPUT_CHARS:
+                        raise RuntimeError(f"审查发现超过 {MAX_NODE_OUTPUT_CHARS} 字符上限，不能判定通过")
+                    if trace:
+                        traces.append({"t":"meta","text":f"审查片段 {index}/{total}"})
+                        traces.extend(trace)
+                    inputs.append(f"[审查片段 {index}/{total}]\n{actual_input}")
+            except Exception as exc:
+                for future in futures:
+                    future.cancel()
+                if failures and failures[0] is not exc:
+                    raise failures[0] from exc
+                raise
         combined = ("\n\n".join(summaries) + "\n\n```json\n" +
                     json.dumps({"findings": findings}, ensure_ascii=False) + "\n```")
         if len(combined) > MAX_NODE_OUTPUT_CHARS:
@@ -176,28 +228,49 @@ def _run_reviewer_step(step: dict, project: dict, workdir: Path,
         return combined, traces, "\n\n".join(inputs)
     is_api = step.get("kind") == "api"
     prompt_text = _node_prompt(step, built, prior, workdir, api=is_api)
-    if built.get('review_run_id'):
-        with db.conn() as c:
-            for item in built.get('improvement_selected', []):
-                c.execute('INSERT OR IGNORE INTO improvement_uses(run_id,improvement_id,revision,snapshot,created_at) VALUES(?,?,?,?,?)',
-                          (built['review_run_id'], item['id'], item['revision'], improvements.pack(item), db.now()))
-    if is_api:
-        text = api_nodes.run(step, prompt_text)
+    cli_slot = _CLI_SLOTS.get(step.get('provider', 'claude')) if not is_api else None
+    with cli_slot or nullcontext(), _MODEL_SLOTS:
+        if built.get('review_cancelled') and built['review_cancelled'].is_set():
+            raise _PartCancelled('同组分片已失败，本片尚未调用模型，已取消；不能判定通过')
+        input_evidence = prompt_text
+        if not is_api:
+            expected_cli=dict(project).get('_cli_identity') or config.cli_identity()
+            if expected_cli!=config.cli_identity():
+                raise reviewers.ReviewerError('CLI 执行器文件已变化，本次输入快照失效，请重新审查')
+            input_evidence += ('\n\n## CLI 输入附件快照（仅审计保存，未追加到模型提示词）\n'
+                               + '\n执行器文件身份：'+json.dumps(expected_cli,ensure_ascii=False)+'\n'
+                               f"\n### 变更文件：{built['diff_file']}\n"
+                               + built['diff_file'].read_text(encoding='utf-8')
+                               + '\n### 派发时的评审规则\n'
+                               + (config.POLICY_DIR / 'REVIEW.md').read_text(encoding='utf-8'))
+        if built.get('part_index') and built.get('part_progress'):
+            built['part_progress'](built['part_index'],built['part_total'],'running')
+        if built.get('review_run_id'):
+            with db.conn() as c:
+                for item in built.get('improvement_selected', []):
+                    c.execute('INSERT OR IGNORE INTO improvement_uses(run_id,improvement_id,revision,snapshot,created_at) VALUES(?,?,?,?,?)',
+                              (built['review_run_id'], item['id'], item['revision'], improvements.pack(item), db.now()))
+        if is_api:
+            text = api_nodes.run(step, prompt_text)
+            if len(text) > MAX_NODE_OUTPUT_CHARS:
+                raise RuntimeError(f"节点输出超过 {MAX_NODE_OUTPUT_CHARS} 字符上限")
+            return text, None, prompt_text
+        provider = step.get("provider", "claude")
+        prompt_file = workdir / f".hub-node-{uuid.uuid4().hex}.txt"
+        prompt_file.write_text(prompt_text, encoding="utf-8")
+        if provider == "claude":
+            text, trace = reviewers.run_claude(workdir, prompt_file, step.get("model") or "")
+        elif provider == "codex":
+            text, trace = reviewers.run_codex(workdir, prompt_file, step.get("model") or "")
+        else:
+            raise RuntimeError(f"未知 Agent 执行器：{provider}")
+        if expected_cli!=config.cli_identity():
+            error=reviewers.ReviewerError('CLI 执行器文件在调用期间变化，结果不可用于本轮通过或采用；原始回复已保留')
+            error.output,error.trace,error.input_evidence=text,trace,input_evidence
+            raise error
         if len(text) > MAX_NODE_OUTPUT_CHARS:
             raise RuntimeError(f"节点输出超过 {MAX_NODE_OUTPUT_CHARS} 字符上限")
-        return text, None, prompt_text
-    provider = step.get("provider", "claude")
-    prompt_file = workdir / f".hub-node-{uuid.uuid4().hex}.txt"
-    prompt_file.write_text(prompt_text, encoding="utf-8")
-    if provider == "claude":
-        text, trace = reviewers.run_claude(workdir, prompt_file, step.get("model") or "")
-    elif provider == "codex":
-        text, trace = reviewers.run_codex(workdir, prompt_file, step.get("model") or "")
-    else:
-        raise RuntimeError(f"未知 Agent 执行器：{provider}")
-    if len(text) > MAX_NODE_OUTPUT_CHARS:
-        raise RuntimeError(f"节点输出超过 {MAX_NODE_OUTPUT_CHARS} 字符上限")
-    return text, trace, prompt_text
+        return text, trace, input_evidence
 
 
 def _run_review_group(group: dict, project: dict, workdir: Path, built: dict,
@@ -217,23 +290,43 @@ def _run_review_group(group: dict, project: dict, workdir: Path, built: dict,
             t0 = sl.start(name)
             slots.append((member, name, t0, getattr(sl, "step_id", None)))
         with ThreadPoolExecutor(max_workers=len(slots), thread_name_prefix="hub-review") as pool:
-            futures = {pool.submit(_run_reviewer_step, member, project, workdir,
-                                   built, diff_text, [dict(item) for item in prior]): i
-                       for i, (member, _, _, _) in enumerate(slots)}
+            futures = {}
+            for i, (member, _, _, step_id) in enumerate(slots):
+                part_states, part_lock = {}, threading.Lock()
+                def part_progress(index, total, status, sid=step_id, states=part_states, lock=part_lock):
+                    # 每个评审器独立状态；不能把先完成的最后一片误称为全部完成。
+                    with lock:
+                        states[index] = status
+                        values = states
+                        done = sum(s=='ok' for s in values.values())
+                        running = [i for i,s in values.items() if s=='running']
+                        db.execute('UPDATE steps SET trace=? WHERE id=?',
+                                   (json.dumps([{'t':'meta','text':f'完整审查分片完成 {done}/{total}；运行 {running}',
+                                                 'status':status}],ensure_ascii=False),sid))
+                futures[pool.submit(_run_reviewer_step, member, project, workdir,
+                                    {**built, 'part_progress':part_progress}, diff_text,
+                                    [dict(item) for item in prior])] = i
             for future in as_completed(futures):
                 i = futures[future]
                 _, name, t0, step_id = slots[i]
                 try:
                     text, trace, prompt_text = future.result()
                     if verdict.extract_findings(text) is None:
-                        raise RuntimeError("评审器未返回有效 findings JSON，不能判定通过")
+                        raise _unparsed_review_error(text,trace,prompt_text)
                 except Exception as exc:
-                    sl.finish(t0, "fail", str(exc), step_id=step_id)
+                    sl.finish(t0, "fail", str(exc)+'\n'+str(getattr(exc,'output','') or ''),
+                              trace=getattr(exc, 'trace', None), prompt=getattr(exc,'input_evidence',None),step_id=step_id)
                     errors.append(f"{name}: {exc}")
                 else:
                     sl.finish(t0, "ok", log=text, trace=trace, prompt=prompt_text, step_id=step_id)
                     outputs[offset + i] = (name, text)
     if errors:
+        valid = [out for out in outputs if out is not None]
+        if valid:
+            partial = verdict.merge_multi(valid)
+            _write_findings(sl.run_id, partial)
+            db.execute('UPDATE runs SET important_count=?,summary=? WHERE id=?',
+                       (partial['important_count'], '交叉评审未完成；保留成功成员的发现供人工核验，不代表整体通过', sl.run_id))
         raise RuntimeError("交叉评审有成员失败；" + "；".join(errors))
     return outputs
 
@@ -416,6 +509,7 @@ def process_run(run_id: int) -> None:
 
 
 def _process_run(run, project) -> None:
+    project={**dict(project),'_cli_identity':config.cli_identity()}
     run_id = run["id"]
     sl = StepLog(run_id)
     workdir = None
