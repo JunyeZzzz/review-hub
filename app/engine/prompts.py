@@ -61,14 +61,16 @@ INIT_PROMPT = """根据下面的仓库信息，用**不超过 3 句中文**概�
 def build(workdir: Path, intent: str = "", profile: str = "", diff_spec: str = "") -> dict:
     """生成 diff 与 prompt 文件；提供 diff_spec 时必须严格使用该审查区间。"""
     base = f"origin/{_default_branch(workdir)}"
+    effective_spec = diff_spec or f"{base}...HEAD"
     diff_result = subprocess.run(
-        ["git", "diff", diff_spec or f"{base}...HEAD"], cwd=workdir,
+        ["git", "diff", effective_spec], cwd=workdir,
         capture_output=True, text=True,
     )
     if diff_spec and diff_result.returncode:
         raise RuntimeError(f"无法取得审查区间 {diff_spec}：{diff_result.stderr[-400:]}")
     diff = diff_result.stdout if diff_result.returncode == 0 else ""
     if not diff_spec and not diff.strip():
+        effective_spec = 'HEAD~1...HEAD'
         # 本地仓库可能没有 origin：退回比较上一次提交
         fallback = subprocess.run(
             ["git", "diff", "HEAD~1...HEAD"], cwd=workdir,
@@ -119,7 +121,10 @@ def build(workdir: Path, intent: str = "", profile: str = "", diff_spec: str = "
         intent_section=intent_section,
         profile_section=profile_section,
     ), encoding="utf-8")
+    names = subprocess.run(['git', 'diff', '--name-only', '-z', effective_spec], cwd=workdir,
+                           capture_output=True, text=True, check=True).stdout
     return {"prompt_file": prompt_file, "diff_file": diff_file,
+            "changed_files": [name for name in names.split('\0') if name],
             "diff_lines": len(lines), "truncated": False,
             "review_parts": part_files,
             "intent": intent, "profile": profile}

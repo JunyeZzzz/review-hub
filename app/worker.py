@@ -12,7 +12,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from . import config, connections, db, github
+from . import config, connections, db, github, improvements
 from .git_auth import auth_env
 from .engine import api_nodes, gates, prompts, reviewers, router, verdict
 
@@ -121,6 +121,7 @@ def _node_prompt(step: dict, built: dict, prior: list[dict], workdir: Path,
         base = built["prompt_file"].read_text(encoding="utf-8")
     if step.get("prompt"):
         base += "\n## 本节点任务与侧重点\n" + step["prompt"] + "\n"
+    base += built.get("improvement_context", "")
     if api:
         base += ("\n## API 节点能力边界\n本节点没有 Read/Grep/Glob 或仓库文件工具。"
                  "以下 diff 与规则已经内联；只根据可见证据判断，无法验证的猜测不要报出。\n")
@@ -175,6 +176,11 @@ def _run_reviewer_step(step: dict, project: dict, workdir: Path,
         return combined, traces, "\n\n".join(inputs)
     is_api = step.get("kind") == "api"
     prompt_text = _node_prompt(step, built, prior, workdir, api=is_api)
+    if built.get('review_run_id'):
+        with db.conn() as c:
+            for item in built.get('improvement_selected', []):
+                c.execute('INSERT OR IGNORE INTO improvement_uses(run_id,improvement_id,revision,snapshot,created_at) VALUES(?,?,?,?,?)',
+                          (built['review_run_id'], item['id'], item['revision'], improvements.pack(item), db.now()))
     if is_api:
         text = api_nodes.run(step, prompt_text)
         if len(text) > MAX_NODE_OUTPUT_CHARS:
@@ -451,7 +457,8 @@ def _process_run(run, project) -> None:
 
         # 风险路由
         t0 = sl.start("风险路由")
-        diff_files = _git(workdir, "diff", "--name-only", diff_spec).stdout.splitlines()
+        diff_files = [name for name in _git(workdir, "diff", "--name-only", "-z", diff_spec).stdout.split('\0') if name]
+        improvement_items = improvements.select(improvements.active_for_project(project['id']), diff_files)
         # 完整 diff 落库（报告页可查，评审对象本体）
         db.execute("UPDATE runs SET diff_text=?, diff_complete=1 WHERE id=?",
                    (_git(workdir, "diff", diff_spec).stdout, run_id))
@@ -510,6 +517,8 @@ def _process_run(run, project) -> None:
             if built is None:
                 built = prompts.build(workdir, intent=intent, profile=project["profile"] or "",
                                       diff_spec=diff_spec)
+                built, _ = improvements.attach(built, improvement_items, diff_files)
+                built.update(review_run_id=run_id, improvement_selected=improvement_items)
             diff_text = built["diff_file"].read_text(encoding="utf-8")
             if step.get("kind") == "review":
                 reviewers_out.extend(_run_review_group(step, project, workdir, built, diff_text, prior, sl))

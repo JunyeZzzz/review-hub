@@ -46,6 +46,10 @@ def _config_snapshot() -> str:
         "credentials": credentials,
         "pipeline": signature(global_steps),
         "projects": {pid: signature(steps) for pid, steps in project_steps.items()},
+        "sample_content": hashlib.sha256(json.dumps([dict(r) for r in db.query('SELECT * FROM eval_cases ORDER BY id')], sort_keys=True).encode()).hexdigest(),
+        "active_improvements": [dict(r) for r in db.query("SELECT * FROM review_improvements WHERE status='active' ORDER BY id")],
+        "profiles": {str(r['id']): r['profile'] for r in db.query('SELECT id,profile FROM projects ORDER BY id')},
+        "cli_models": [config.get_kimi_model(), config.get_claude_model(), config.get_kimi_base_url()],
     }, ensure_ascii=False)
 
 
@@ -100,7 +104,7 @@ def _run_eval(rid: int, cases: list) -> None:
         _eval_lock.release()
 
 
-def _run_case(case: dict, progress=None) -> dict:
+def _run_case(case: dict, progress=None, improvement_items=None) -> dict:
     base = {"case_id": case["id"], "repo": "", "sha": case["head_sha"][:8],
             "polarity": case["polarity"], "expected": json.loads(case["expected"]).get("title", "")}
     trace = []
@@ -138,7 +142,12 @@ def _run_case(case: dict, progress=None) -> dict:
         diff_text = built["diff_file"].read_text(encoding="utf-8")
         outs = []
         prior = []
-        diff_files = [line[6:] for line in diff_text.splitlines() if line.startswith("+++ b/")]
+        diff_files = built.get('changed_files', [line[6:] for line in diff_text.splitlines()
+                                               if line.startswith(('+++ b/', '--- a/'))])
+        from . import improvements
+        items = improvements.active_for_project(project['id']) if improvement_items is None else improvement_items
+        built, selected = improvements.attach(built, items, diff_files)
+        base['improvements'] = [{'id': i['id'], 'revision': i['revision']} for i in selected]
         for step in worker.get_pipeline(project):
             if not step.get("enabled", True):
                 continue
@@ -161,6 +170,7 @@ def _run_case(case: dict, progress=None) -> dict:
                 worker._git_retry(workdir, "clean", "-fdx")
                 built = prompts.build(workdir, intent=case["intent"] or "",
                                       profile=project["profile"] or "", diff_spec=diff_spec)
+                built, _ = improvements.attach(built, items, diff_files)
                 diff_text = built["diff_file"].read_text(encoding="utf-8")
                 continue
             if step.get("kind") == "review":
@@ -208,6 +218,7 @@ def _run_case(case: dict, progress=None) -> dict:
         if not outs:
             raise RuntimeError("评测没有有效的评审器输出，不能判定通过")
         merged = verdict.merge_multi(outs)
+        base['reviews'] = [{'name': name, 'output': output} for name, output in outs]
         stage("与人工答案比对")
     except Exception as e:
         running = [entry for entry in trace if entry["status"] == "running"]
@@ -224,7 +235,8 @@ def _run_case(case: dict, progress=None) -> dict:
         expected = json.loads(case["expected"])
         got_list = [f for f in merged["findings"] if verdict.similar(f, expected)]
         actual = [{"severity": f.get("severity"), "file": f.get("file"),
-                   "line": f.get("line"), "title": f.get("title")}
+                   "line": f.get("line"), "title": f.get("title"),
+                   "condition": f.get("condition"), "fix": f.get("fix")}
                   for f in merged["findings"]]
     except Exception as e:
         trace[-1]["status"] = "fail"

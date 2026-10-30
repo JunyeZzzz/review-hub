@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import config, connections, db, diagnostics, evaluator, github, worker
+from . import config, connections, db, diagnostics, evaluator, github, worker, improvements
 from .engine import api_nodes, gates, prompts, reviewers
 
 app = FastAPI(title="Review Hub", docs_url=None, redoc_url=None)
@@ -47,6 +47,7 @@ def startup() -> None:
         raise RuntimeError("公网 PUBLIC_BASE_URL 必须使用 HTTPS")
     db.init()
     evaluator.recover_interrupted()
+    improvements.recover_interrupted()
     connections.scrub_clone_remotes()
     worker.start_background()
 
@@ -617,10 +618,20 @@ def reinit_project(pid: int):
 
 @app.delete("/api/projects/{pid}")
 def delete_project(pid: int):
-    db.execute("DELETE FROM finding_marks WHERE run_id IN (SELECT id FROM runs WHERE project_id=?)", (pid,))
-    db.execute("DELETE FROM run_failure_events WHERE run_id IN (SELECT id FROM runs WHERE project_id=?)", (pid,))
-    db.execute("DELETE FROM runs WHERE project_id=?", (pid,))
-    db.execute("DELETE FROM projects WHERE id=?", (pid,))
+    with db.conn() as c:
+        c.execute('BEGIN IMMEDIATE')
+        if c.execute("SELECT 1 FROM review_improvements WHERE project_id=? AND status IN ('analyzing','validating')", (pid,)).fetchone():
+            raise HTTPException(409, '请等待项目改进任务结束后删除')
+        if c.execute("SELECT 1 FROM runs WHERE project_id=? AND status IN ('running','queued')", (pid,)).fetchone():
+            raise HTTPException(409, '请等待项目审查结束后删除')
+        for table in ('finding_marks', 'run_failure_events', 'steps', 'improvement_uses'):
+            c.execute(f'DELETE FROM {table} WHERE run_id IN (SELECT id FROM runs WHERE project_id=?)', (pid,))
+        for table in ('improvement_sources', 'improvement_events', 'improvement_validations'):
+            c.execute(f'DELETE FROM {table} WHERE improvement_id IN (SELECT id FROM review_improvements WHERE project_id=?)', (pid,))
+        c.execute('DELETE FROM feedback_events WHERE feedback_id IN (SELECT id FROM review_feedback WHERE project_id=?)', (pid,))
+        for table in ('eval_cases', 'review_feedback', 'review_improvements', 'runs'):
+            c.execute(f'DELETE FROM {table} WHERE project_id=?', (pid,))
+        c.execute('DELETE FROM projects WHERE id=?', (pid,))
     return {"ok": True}
 
 
@@ -841,6 +852,8 @@ def get_run(run_id: int):
     steps = db.query("SELECT * FROM steps WHERE run_id=? ORDER BY idx", (run_id,))
     d = dict(run)
     d["steps"] = [dict(s) for s in steps]
+    d['improvements'] = [dict(u) | {'snapshot': json.loads(u['snapshot'])} for u in db.query(
+        'SELECT * FROM improvement_uses WHERE run_id=?', (run_id,))]
     d["findings"] = json.loads(run["findings_json"]) if run["findings_json"] else []
     d["has_diff"] = bool(run["diff_text"])
     d.pop("diff_text", None)   # diff 走独立端点，避免报告轮询背负大文件
@@ -891,12 +904,13 @@ def run_diff(run_id: int):
 class MarkIn(BaseModel):
     disposition: str          # confirmed | false_positive | ""（清空标记）
     note: str = ""
+    evidence: str = ""
 
 
 @app.post("/api/runs/{run_id}/findings/{idx}/mark")
 def mark_finding(run_id: int, idx: int, body: MarkIn):
     """人工处置一条发现：确认（真问题）/ 误报。这是噪声测量的数据源头。"""
-    run = db.get("SELECT id FROM runs WHERE id=?", (run_id,))
+    run = db.get("SELECT * FROM runs WHERE id=?", (run_id,))
     if not run:
         raise HTTPException(404, "run 不存在")
     total = len(json.loads(db.get("SELECT findings_json FROM runs WHERE id=?", (run_id,))["findings_json"] or "[]"))
@@ -904,15 +918,118 @@ def mark_finding(run_id: int, idx: int, body: MarkIn):
         raise HTTPException(400, f"发现下标越界（共 {total} 条）")
     if body.disposition not in ("confirmed", "false_positive", ""):
         raise HTTPException(400, "disposition 只能是 confirmed / false_positive / 空串")
-    if body.disposition == "":
-        db.execute("DELETE FROM finding_marks WHERE run_id=? AND idx=?", (run_id, idx))
-    else:
-        db.execute(
+    if run['status'] not in ('passed', 'blocked', 'failed'):
+        raise HTTPException(409, '请等待审查结束后再判定')
+    finding = json.loads(run['findings_json'] or '[]')[idx]
+    if any(str(s).startswith('gate:') or str(s) == 'gitleaks-like' for s in finding.get('sources', [])):
+        raise HTTPException(400, '机械门禁结果不能作为模型反馈')
+    note = _bounded_text(body.note.strip(), 3000, "判定原因")
+    evidence = _bounded_text(body.evidence.strip(), 3000, "判定证据")
+    with db.conn() as c:
+        c.execute('BEGIN IMMEDIATE')
+        if body.disposition == "":
+            c.execute("DELETE FROM finding_marks WHERE run_id=? AND idx=?", (run_id, idx))
+        else:
+            c.execute(
             "INSERT INTO finding_marks(run_id,idx,disposition,note,updated_at) VALUES(?,?,?,?,?)"
             " ON CONFLICT(run_id,idx) DO UPDATE SET disposition=excluded.disposition,"
             " note=excluded.note, updated_at=excluded.updated_at",
-            (run_id, idx, body.disposition, _bounded_text(body.note.strip(), 500, "处置备注"), db.now()))
-    return {"ok": True, "disposition": body.disposition}
+                (run_id, idx, body.disposition, note, db.now()))
+        fid = improvements.capture(c, run, idx, body.disposition, note, evidence)
+    return {"ok": True, "disposition": body.disposition, "feedback_id": fid}
+
+
+@app.get('/api/improvements')
+def improvement_overview():
+    return improvements.overview()
+
+
+@app.post('/api/feedback/missed')
+def feedback_missed(body: dict):
+    if type(body.get('run_id')) is not int:
+        raise HTTPException(400, 'run_id 必须是整数')
+    run = db.get("SELECT r.* FROM runs r JOIN projects p ON p.id=r.project_id WHERE r.id=? AND p.kind='github'", (body.get('run_id'),))
+    if not run or run['status'] not in ('passed', 'blocked', 'failed') or not run['head_sha']:
+        raise HTTPException(400, '请选择有提交号且已结束的 GitHub 审查')
+    fields = {}
+    for key, limit in [('title',160), ('file',500), ('condition',3000), ('reason',3000), ('evidence',3000)]:
+        value = body.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise HTTPException(400, f'{key} 必填')
+        fields[key] = _bounded_text(value.strip(), limit, key)
+    if type(body.get('line')) is not int or body['line'] < 1:
+        raise HTTPException(400, '行号必须是正整数')
+    c = db.conn()
+    with c:
+        c.execute('BEGIN IMMEDIATE')
+        idx = min(0, c.execute('SELECT COALESCE(MIN(idx),0) n FROM review_feedback WHERE run_id=?', (run['id'],)).fetchone()['n']) - 1
+        finding = {k:fields[k] for k in ('title','file','condition')}
+        finding.update(line=body['line'],severity='IMPORTANT',sources=['human:missed'])
+        fid = improvements.capture(c, run, idx, 'confirmed', fields['reason'], fields['evidence'], finding)
+    return {'ok':True, 'feedback_id':fid}
+
+
+@app.put('/api/feedback/{fid}')
+def feedback_update(fid: int, body: MarkIn):
+    row = db.get('SELECT * FROM review_feedback WHERE id=?', (fid,))
+    if not row:
+        raise HTTPException(404, '反馈不存在')
+    if row['idx'] >= 0:
+        return mark_finding(row['run_id'], row['idx'], body)
+    if body.disposition not in ('confirmed', ''):
+        raise HTTPException(400, '人工补充漏报可确认或撤销')
+    run = db.get('SELECT * FROM runs WHERE id=?', (row['run_id'],))
+    if not run:
+        raise HTTPException(404, '原始审查已删除')
+    with db.conn() as c:
+        c.execute('BEGIN IMMEDIATE')
+        improvements.capture(c, run, row['idx'], body.disposition,
+                             _bounded_text(body.note.strip(),3000,'判定原因'),
+                             _bounded_text(body.evidence.strip(),3000,'证据'),json.loads(row['finding']))
+    return {'ok': True, 'feedback_id':fid}
+
+
+@app.get('/api/improvements/{iid}')
+def improvement_detail(iid: int):
+    return improvements.get_detail(iid)
+
+
+@app.post('/api/improvements')
+def improvement_create(body: dict):
+    return improvements.save_candidate(body)
+
+
+@app.post('/api/improvements/draft')
+def improvement_draft(body: dict):
+    ids = body.get('feedback_ids', [])
+    if not isinstance(ids, list) or any(type(i) is not int for i in ids):
+        raise HTTPException(400, 'feedback_ids 必须是整数列表')
+    return improvements.start_draft(ids)
+
+
+@app.put('/api/improvements/{iid}')
+def improvement_edit(iid: int, body: dict):
+    return improvements.save_candidate(body, iid)
+
+
+@app.post('/api/improvements/{iid}/validate')
+def improvement_validate(iid: int):
+    return improvements.start_validation(iid)
+
+
+@app.post('/api/improvements/{iid}/adopt')
+def improvement_adopt(iid: int):
+    return improvements.adopt(iid)
+
+
+@app.post('/api/improvements/{iid}/revoke')
+def improvement_revoke(iid: int):
+    return improvements.revoke(iid)
+
+
+@app.post('/api/improvement-validations/{vid}/review')
+def improvement_review_validation(vid: int, body: dict):
+    return improvements.review_validation(vid, body)
 
 
 # ---------------- 评测集：改提示词/换模型前先过回归 ----------------
@@ -934,12 +1051,14 @@ def add_eval_case(body: EvalCaseIn):
     if not run["head_sha"]:
         raise HTTPException(400, "该 run 没有提交号（可能没跑到变更采集就失败），无法作为评测用例")
     try:
+        if body.idx < 0:
+            raise IndexError
         findings = json.loads(run["findings_json"] or "[]")
         f = findings[body.idx]
     except (IndexError, TypeError, json.JSONDecodeError):
         raise HTTPException(400, "发现下标无效")
-    if f.get("severity") != "IMPORTANT":
-        raise HTTPException(400, "只有 Important 发现可以存为评测用例")
+    if f.get("severity") not in ('IMPORTANT', 'NIT'):
+        raise HTTPException(400, "只有本次 Important 或 Nit 发现可以存为评测用例")
     if any(str(s).startswith("gate:") for s in f.get("sources") or []):
         raise HTTPException(400, "门禁发现是机械结果，不进评测集")
     mark = db.get("SELECT disposition FROM finding_marks WHERE run_id=? AND idx=?",

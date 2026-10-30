@@ -1,5 +1,6 @@
 # 差距分析：Review Hub 现状 vs Claude Code 团队评审体系（推文完整版）
 
+> 2026-10-30 更新：反馈到候选、配对验证、人工核对、采用／撤销及实际使用追踪已实现，当前契约见 [审查改进闭环](REVIEW-IMPROVEMENTS.md)。下文保留此前版本的设计记录。
 > 对标文章：How the Claude Code team does code review（Anthropic Claude Code 团队）。
 > 本文记录现有实现与文章完整版之间的全部差距、已主动砍掉的部分、以及按价值排序的补齐路线。
 > 最近更新：2026-10-28（新增当前实施状态；下方原始分析保留为历史快照）

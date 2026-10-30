@@ -120,6 +120,46 @@ CREATE TABLE IF NOT EXISTS config_versions (
   value TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS review_feedback (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
+ run_id INTEGER NOT NULL, idx INTEGER NOT NULL, disposition TEXT NOT NULL,
+ reason TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '',
+ finding TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(run_id,idx)
+);
+CREATE TABLE IF NOT EXISTS review_improvements (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
+ title TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'check',
+ scope TEXT NOT NULL DEFAULT '*', rationale TEXT NOT NULL DEFAULT '',
+ instruction TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '',
+ status TEXT NOT NULL DEFAULT 'draft', revision INTEGER NOT NULL DEFAULT 1,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS feedback_events (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, feedback_id INTEGER NOT NULL,
+ snapshot TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS improvement_sources (
+ improvement_id INTEGER NOT NULL, feedback_id INTEGER NOT NULL,
+ PRIMARY KEY(improvement_id,feedback_id)
+);
+CREATE TABLE IF NOT EXISTS improvement_events (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, improvement_id INTEGER NOT NULL,
+ action TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS improvement_validations (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, improvement_id INTEGER NOT NULL,
+ revision INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'running',
+ fingerprint TEXT NOT NULL, snapshot TEXT NOT NULL,
+ results TEXT NOT NULL DEFAULT '[]', progress TEXT NOT NULL DEFAULT '',
+ error TEXT NOT NULL DEFAULT '', eligible INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL, finished_at TEXT
+);
+CREATE TABLE IF NOT EXISTS improvement_uses (
+ run_id INTEGER NOT NULL, improvement_id INTEGER NOT NULL, revision INTEGER NOT NULL,
+ snapshot TEXT NOT NULL, created_at TEXT NOT NULL,
+ PRIMARY KEY(run_id,improvement_id)
+);
 CREATE TABLE IF NOT EXISTS eval_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   status TEXT NOT NULL DEFAULT 'running',     -- running|done|failed
@@ -163,6 +203,12 @@ def init() -> None:
     c = conn()
     c.executescript(SCHEMA)
     eval_cols = {r[1] for r in c.execute("PRAGMA table_info(eval_runs)")}
+    validation_cols = {r[1] for r in c.execute('PRAGMA table_info(improvement_validations)')}
+    if 'review_note' not in validation_cols:
+        c.execute("ALTER TABLE improvement_validations ADD COLUMN review_note TEXT NOT NULL DEFAULT ''")
+    improvement_cols = {r[1] for r in c.execute('PRAGMA table_info(review_improvements)')}
+    if 'activation_signature' not in improvement_cols:
+        c.execute("ALTER TABLE review_improvements ADD COLUMN activation_signature TEXT NOT NULL DEFAULT ''")
     for col, definition in (("current_case_id", "INTEGER"), ("current_stage", "TEXT"),
                             ("current_detail", "TEXT"), ("current_trace", "TEXT")):
         if col not in eval_cols:
@@ -190,6 +236,23 @@ def init() -> None:
     for col in ("account_login", "last_checked_at", "last_error"):
         if col not in ccols:
             c.execute(f"ALTER TABLE github_connections ADD COLUMN {col} TEXT")
+    c.commit()
+    if get_setting('feedback_samples_migration_v1') != 'done':
+        # 历史有效判定补齐样本；只迁移一次，之后删除样本不会被启动恢复。
+        c.execute("INSERT OR IGNORE INTO eval_cases(project_id,run_id,idx,polarity,head_sha,intent,expected,created_at) "
+                  "SELECT r.project_id,m.run_id,m.idx,CASE WHEN m.disposition='confirmed' THEN 'positive' ELSE 'negative' END,"
+                  "r.head_sha,COALESCE(r.intent,''),j.value,m.updated_at "
+                  "FROM finding_marks m JOIN runs r ON r.id=m.run_id JOIN projects p ON p.id=r.project_id "
+                  "JOIN json_each(COALESCE(r.findings_json,'[]')) j ON CAST(j.key AS INTEGER)=m.idx "
+                  "WHERE p.kind='github' AND COALESCE(r.head_sha,'')<>'' "
+                  "AND NOT EXISTS (SELECT 1 FROM json_each(json_extract(j.value,'$.sources')) s WHERE s.value LIKE 'gate:%' OR s.value='gitleaks-like')")
+        c.commit()
+        set_setting('feedback_samples_migration_v1', 'done')
+    # 旧判定进入反馈收件箱；不推断原因，不自动采用任何策略。
+    c.execute("INSERT OR IGNORE INTO review_feedback(project_id,run_id,idx,disposition,reason,finding,created_at,updated_at) "
+              "SELECT r.project_id,m.run_id,m.idx,m.disposition,COALESCE(m.note,''),j.value,m.updated_at,m.updated_at "
+              "FROM finding_marks m JOIN runs r ON r.id=m.run_id "
+              "JOIN json_each(COALESCE(r.findings_json,'[]')) j ON CAST(j.key AS INTEGER)=m.idx")
     c.commit()
     if get_setting("pipeline_node_migration_v1") != "done":
         # 旧执行器曾在读取时隐式补测试门禁。迁移一次使真实执行顺序可见；

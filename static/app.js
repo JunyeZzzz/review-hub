@@ -209,9 +209,10 @@ document.addEventListener("click", async (e) => {
   const runId = +b.dataset.run, idx = +b.dataset.idx, val = b.dataset.mark;
   const next = (b.dataset.cur || "") === val ? "" : val;
   try {
-    await api(`/api/runs/${runId}/findings/${idx}/mark`, { method: "POST", body: { disposition: next } });
-    toast(next === "false_positive" ? "已标记误报；可保存负例样本，或加入不再报告规则"
-      : next === "confirmed" ? "已确认问题；可保存为应报出的回归样本" : "已撤销判定");
+    const detail = next ? await imMarkDialog(next) : {};
+    if (detail === null) return;
+    await api(`/api/runs/${runId}/findings/${idx}/mark`, { method: "POST", body: { disposition: next, ...detail } });
+    toast(next ? "反馈与回归样本已保存；到工作台追踪改进进度" : "判定已撤销；关联验证失效，生效改进已撤销");
     if (location.hash === `#/runs/${runId}`) renderRun(runId, true);
     else if (location.hash === "#/workbench") refreshWorkbenchData();
   } catch (err) { toast(err.message, true); }
@@ -635,37 +636,6 @@ async function batchMark(val) {
   } catch (e) { toast(e.message, true); }
 }
 
-async function feedbackRule(runId, idx, title, file) {
-  if (!await uiConfirm(`将“${title}”写入“不再报告”规则，并保存为负例样本？之后可运行回归评测，检查它是否再次出现。`,
-    "修正规则并保存样本")) return;
-  try {
-    const p = await api("/api/prompt");
-    let rules = p.rules || "";
-    if (rules.includes(title)) { toast("这条模式已在规则里，继续检查负例样本"); }
-    else {
-      const line = `- ${title}（样例 ${file || "无文件信息"} · run#${runId}，已确认误报）`;
-      const anchor = "## 一律不报";
-      rules = rules.includes(anchor) ? rules.replace(anchor, anchor + "\n" + line)
-                                     : rules + `\n${anchor}\n${line}\n`;
-      await api("/api/prompt", { method: "PUT", body: { rules } });
-    }
-    // 已确认的误报保存为负例样本，下一次回归评测检查它是否再次出现。
-    try {
-      const r = await api("/api/eval/cases", { method: "POST", body: { run_id: +runId, idx: +idx } });
-      toast(r.existed ? "规则已更新，负例样本已存在"
-        : "规则已更新，负例样本已保存；可到工作台运行回归评测");
-    } catch (e) {
-      toast(`规则已更新；负例样本保存失败：${e.message}`, true);
-    }
-  } catch (e) { toast(e.message, true); }
-}
-document.addEventListener("click", (e) => {
-  const b = e.target.closest("[data-fb-run]");
-  if (!b) return;
-  e.stopPropagation();
-  feedbackRule(b.dataset.fbRun, b.dataset.fbIdx, b.dataset.fbTitle, b.dataset.fbFile);
-});
-
 async function refreshMarks() {
   const q = new URLSearchParams();
   if (marksFilter.disposition) q.set("disposition", marksFilter.disposition);
@@ -839,37 +809,7 @@ function qualityLoopHtml(d) {
     </div><div class="qa-loop-foot"><span>节点、提示词或规则改动</span><span>↶ 用同一批样本再次验证</span>
       <a href="#/runs">到报告中判定并保存样本 →</a></div></section>`;
 }
-function qualityWorkbenchHtml(d) {
-  const next = qualityNext(d), h = qualityLatest(d), cases = d.eval.cases.length;
-  const nextAction = next.runEval
-    ? `<button class="primary" data-qa-run>${next.action} →</button>`
-    : next.toggle ? `<button class="primary" data-qa-toggle="qa-details">${next.action} →</button>`
-      : `<a class="primary qa-primary-link" href="${esc(next.href)}">${next.action} →</a>`;
-  return `<div class="qa-page">
-    <div class="qa-page-head"><div><span class="wb-eyebrow">审查质量</span><h1>质量工作台</h1>
-      <p>在这里决定下一步、验证评审质量；具体问题和处置在审查报告中完成。</p></div>
-      <a href="#/runs" class="qa-all-link">全部审查报告 ↗</a></div>
-    <div class="qa-hero-grid">
-      <section class="panel qa-mission ${next.tone}"><span class="qa-kicker">现在该做什么 · ${next.label}</span>
-        <h2>${next.title}</h2><p>${next.text}</p>${nextAction}</section>
-      <section class="panel qa-snapshot"><h2>当前状态</h2>
-        <div class="qa-snapshot-row"><span>待人工判断</span><strong>${d.marks.stats.pending}</strong></div>
-        <div class="qa-snapshot-row"><span>已保存的回归样本</span><strong>${cases}</strong></div>
-        <div class="qa-snapshot-row"><span>上次回归</span><strong class="qa-snapshot-result">${qualityShortResult(h)}</strong></div>
-      </section></div>
-    ${qualityLoopHtml(d)}
-    <div class="qa-operate-grid">
-      <section class="panel qa-operate"><div class="qa-card-heading"><div><h3>需要处理的报告</h3>
-        <p>工作台只列任务；打开报告查看发现并完成处置。</p></div><a href="#/runs">查看全部 →</a></div>
-        <div class="qa-task-list">${qualityAttentionHtml(d)}</div></section>
-      <section class="panel qa-operate"><div class="qa-card-heading"><div><h3>回归检验</h3>
-        <p>改规则或模型前后，拿同一批样本对照。</p></div></div>
-        <div id="qa-eval-status">${qualityEvalHtml(d)}</div></section>
-    </div>
-    <section class="panel qa-details" id="qa-details" hidden>${qualityDetailsHtml(d)}</section>
-    <section class="panel qa-trend">${qualityTrendHtml(d)}</section>
-  </div>`;
-}
+function qualityWorkbenchHtml(d) { return improvementWorkbenchHtml(d); }
 async function refreshWorkbenchData() {
   if (location.hash === "#/workbench") renderWorkbench();
 }
@@ -878,13 +818,14 @@ async function renderWorkbench() {
   setTitle("质量工作台");
   showSkeleton();
   try {
-    const [projects, runs, failures, marks, evaluation, metrics] = await Promise.all([
+    const [projects, runs, failures, marks, evaluation, metrics, improvements] = await Promise.all([
       api("/api/projects"), api("/api/runs?limit=40"), api("/api/runs?status=failed&unhandled=true&limit=40"), api("/api/marks"),
-      api("/api/eval/last"), api("/api/metrics"),
+      api("/api/eval/last"), api("/api/metrics"), api("/api/improvements"),
     ]);
     if (location.hash !== "#/workbench") return;
-    qualityData = { projects, runs, failures, marks, eval: evaluation, metrics };
+    qualityData = { projects, runs, failures, marks, eval: evaluation, metrics, improvements };
     $app.innerHTML = qualityWorkbenchHtml(qualityData);
+    bindImprovements();
     bindQualityActions();
     if (evaluation.history?.[0]?.status === "running") pollEval();
   } catch (e) { errorPanel(e.message); }
@@ -928,7 +869,7 @@ async function renderMarks() {
   $app.innerHTML = `
     ${pageHead({
       title: "处置",
-      sub: "判定发现后，可把误报模式写入不再报告规则，再运行回归评测",
+      sub: "判定反馈 → 项目候选改进 → 对照验证 → 采用生效",
     })}
     <div class="stats" id="mk-stats"></div>
 
@@ -1429,7 +1370,7 @@ async function renderRun(id, silent) {
 }
 
 function runBannerHtml(run) {
-  return {
+  const banner = {
     passed: run.diff_complete === 1
       ? `<div class="banner passed"><span class="mark"></span><div><b>审查完成</b> —— 完整变更已输入评审，未报告 Important；这不保证没有遗漏。</div></div>`
       : `<div class="banner failed"><span class="mark"></span><div><b>历史记录标记为通过</b> —— 当时未记录 diff 完整性，旧版可能截断审查输入；需要可信结论请重新审查。</div></div>`,
@@ -1442,6 +1383,7 @@ function runBannerHtml(run) {
     running: `<div class="banner running"><span class="mark"></span><div><b>审查进行中</b>… 只刷新变化的步骤，页面不再整页重载</div></div>`,
     queued: `<div class="banner running"><span class="mark"></span><div><b>排队中</b>…</div></div>`,
   }[run.status] || "";
+  return banner + ((run.improvements || []).length ? `<details class="panel" style="padding:12px;margin-bottom:12px"><summary class="small">本次使用的项目改进 · ${run.improvements.length} 项</summary>${run.improvements.map(u=>`<div class="small" style="padding:8px"><b>#${u.improvement_id} v${u.revision} · ${esc(u.snapshot.title)}</b><p>${esc(u.snapshot.instruction)}</p><code>${esc(u.snapshot.scope)}</code></div>`).join("")}</details>` : "");
 }
 
 async function triageFailure(runId, action, onDone) {
@@ -1815,10 +1757,8 @@ function markButtonsHtml(run, f) {
   const evalBtn = (run.project_kind === "github" && f.severity === "IMPORTANT" && cur)
     ? `<button class="ghost small-btn" data-eval-run="${run.id}" data-eval-idx="${f._idx}"
         title="确认=应报出样本；误报=不应再报样本">存为样本</button>` : "";
-  const ruleBtn = f.severity === "IMPORTANT" && cur === "false_positive"
-    ? `<button class="ghost small-btn" data-fb-run="${run.id}" data-fb-idx="${f._idx}"
-        data-fb-title="${esc(f.title)}" data-fb-file="${esc(f.file || "")}">加入不再报告规则</button>` : "";
-  return `${btn("confirmed", "确认")}${btn("false_positive", "误报")}${evalBtn}${ruleBtn}`;
+  const progressBtn = cur ? `<button class="ghost small-btn" data-feedback-run="${run.id}" data-feedback-idx="${f._idx}">反馈进度 ↗</button>` : "";
+  return `${btn("confirmed", "确认")}${btn("false_positive", "误报")}${evalBtn}${progressBtn}`;
 }
 
 /* 复制完整问题（标题/位置/触发/建议），发给改代码的人直接能看懂 */
